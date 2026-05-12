@@ -1,0 +1,84 @@
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-ssr/
+*.local
+
+# Rust 编译产物
+target/
+src-tauri/target/
+
+# Tauri 生成的临时文件
+src-tauri/gen/
+
+# FFmpeg 二进制文件（文件太大，不应提交到 git）
+src-tauri/binaries/
+
+# 可执行文件和动态链接库
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 环境变量文件
+.env
+.env.local
+.env.*.local
+
+# 包管理器缓存
+.npm/
+.yarn/
+*.tgz
+
+# IDE 配置
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.sublime*
+.vs/
+
+# 系统文件
+.DS_Store
+.Thumbs.db
+
+# 运行时数据
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# 数据库文件（用户数据，不应提交）
+*.db
+*.sqlite
+*.sqlite3
+
+# 录制的视频文件（用户数据，不应提交）
+*.mp4
+*.flv
+*.mkv
+*.avi
+*.mov
+
+# AI 开发工具
+.claude/
+.cursor/
+.copilot/
+.devin/
+.windsurf/
+.ai/
+
+# 可选：包锁定文件（建议提交，保证依赖版本一致）
+# package-lock.json
+# yarn.lock
+# bun.lockb
