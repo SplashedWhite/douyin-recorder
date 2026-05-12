@@ -105,8 +105,13 @@
     </div>
 
     <template #footer>
-      <el-button @click="visible = false">取消</el-button>
-      <el-button type="primary" @click="onSave" :loading="saving">保存</el-button>
+      <div class="footer-row">
+        <span class="version-text">v{{ version }}</span>
+        <div>
+          <el-button @click="visible = false">取消</el-button>
+          <el-button type="primary" @click="onSave" :loading="saving">保存</el-button>
+        </div>
+      </div>
     </template>
   </el-dialog>
 </template>
@@ -114,12 +119,16 @@
 <script setup lang="ts">
 import { ref, reactive } from 'vue'
 import { useRecorderStore } from '../stores/recorder'
+import { getVersion } from '@tauri-apps/api/app'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 const visible = defineModel<boolean>({ default: false })
 const store = useRecorderStore()
 const saving = ref(false)
 const migrating = ref(false)
+const version = ref('')
+
+getVersion().then(v => { version.value = v })
 
 const form = reactive({
   proxy: '',
@@ -233,5 +242,16 @@ async function onSave() {
 .time-options {
   display: flex;
   gap: 8px;
+}
+
+.footer-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.version-text {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
 }
 </style>

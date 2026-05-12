@@ -100,24 +100,36 @@ async fn add_room(state: State<'_, AppState>, url: String) -> Result<LiveRoom, S
 
 #[tauri::command]
 async fn refresh_room(state: State<'_, AppState>, room_id: i64) -> Result<LiveRoom, String> {
-    let douyin_url = {
+    let (douyin_url, old_anchor_name, old_room_title, old_cover_url, old_avatar_url) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let rooms = db.get_all_rooms().map_err(|e| e.to_string())?;
         let room = rooms.into_iter().find(|r| r.id == room_id)
             .ok_or_else(|| "房间不存在".to_string())?;
-        format!("https://live.douyin.com/{}", room.room_id)
+        (
+            format!("https://live.douyin.com/{}", room.room_id),
+            room.anchor_name,
+            room.room_title,
+            room.cover_url,
+            room.avatar_url,
+        )
     };
 
     let app_settings = settings::load_settings();
     let info = parser::parse_douyin_url(&douyin_url, &app_settings).await?;
 
+    // Preserve existing values when API returns empty (e.g. stream is offline)
+    let anchor_name = if info.anchor_name.is_empty() { old_anchor_name } else { info.anchor_name };
+    let room_title = if info.room_title.is_empty() { old_room_title } else { info.room_title };
+    let cover_url = if info.cover_url.is_empty() { old_cover_url } else { info.cover_url };
+    let avatar_url = if info.avatar_url.is_empty() { old_avatar_url } else { info.avatar_url };
+
     let db = state.db.lock().map_err(|e| e.to_string())?;
     db.update_room_live_status(
         room_id,
-        &info.anchor_name,
-        &info.room_title,
-        &info.cover_url,
-        &info.avatar_url,
+        &anchor_name,
+        &room_title,
+        &cover_url,
+        &avatar_url,
         info.is_live,
     ).map_err(|e| e.to_string())?;
 
