@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 pub struct RecordingProcess {
     pub child: Child,
     pub output_path: String,
@@ -46,6 +49,9 @@ impl Recorder {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
         if !proxy.is_empty() {
             cmd.env("http_proxy", proxy);

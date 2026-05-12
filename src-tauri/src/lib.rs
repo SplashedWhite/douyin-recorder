@@ -9,6 +9,9 @@ use settings::AppSettings;
 use std::sync::Mutex;
 use tauri::State;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 fn resolve_ffmpeg_path() -> String {
     let ext = if cfg!(windows) { ".exe" } else { "" };
     let target = if cfg!(target_os = "windows") {
@@ -240,9 +243,11 @@ fn stop_record(state: State<AppState>, task_id: i64) -> Result<RecordTask, Strin
         if let Some(ref fp) = file_path {
             if fp.ends_with(".flv") {
                 let mp4_path = fp.trim_end_matches(".flv").to_string() + ".mp4";
-                if let Ok(output) = std::process::Command::new(resolve_ffmpeg_path())
-                    .args(["-y", "-i", fp, "-c", "copy", &mp4_path])
-                    .output()
+                let mut cmd = std::process::Command::new(resolve_ffmpeg_path());
+                cmd.args(["-y", "-i", fp, "-c", "copy", &mp4_path]);
+                #[cfg(windows)]
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                if let Ok(output) = cmd.output()
                 {
                     if output.status.success() && std::path::Path::new(&mp4_path).exists() {
                         let file_size = std::fs::metadata(&mp4_path).map(|m| m.len() as i64).unwrap_or(0);
@@ -281,8 +286,11 @@ fn convert_to_mp4(state: State<AppState>, task_id: i64) -> Result<String, String
 
     let mp4_path = file_path.trim_end_matches(".flv").to_string() + ".mp4";
 
-    let output = std::process::Command::new(resolve_ffmpeg_path())
-        .args(["-y", "-i", &file_path, "-c", "copy", &mp4_path])
+    let mut cmd = std::process::Command::new(resolve_ffmpeg_path());
+    cmd.args(["-y", "-i", &file_path, "-c", "copy", &mp4_path]);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let output = cmd
         .output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
