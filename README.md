@@ -31,9 +31,9 @@
 
 > 主界面：直播间列表 + 录制任务管理
 >
-> ![screenshot1](assets\screenshot1.png)
+> ![screenshot1](assets/screenshot1.png)
 >
-> ![screenshot2](assets\screenshot2.png)
+> ![screenshot2](assets/screenshot2.png)
 
 </div>
 
