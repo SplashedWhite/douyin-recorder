@@ -45,6 +45,16 @@ export const useRecorderStore = defineStore('recorder', () => {
     }
   }
 
+  async function refreshAllRooms() {
+    const results = await Promise.allSettled(
+      rooms.value.map(room => refreshRoom(room.id))
+    )
+    const failed = results.filter(r => r.status === 'rejected').length
+    if (failed > 0) {
+      console.warn(`批量刷新完成，${failed} 个房间刷新失败`)
+    }
+  }
+
   async function deleteRoom(id: number, cascade = false) {
     try {
       await invoke('delete_room', { id, cascade })
@@ -151,7 +161,7 @@ export const useRecorderStore = defineStore('recorder', () => {
 
   return {
     rooms, tasks, loading, settings,
-    loadRooms, addRoom, refreshRoom, deleteRoom, getRoomTaskCount,
+    loadRooms, addRoom, refreshRoom, refreshAllRooms, deleteRoom, getRoomTaskCount,
     loadTasks, startRecord, stopRecord, deleteTask, convertToMp4,
     loadSettings, saveSettings, migrateDb
   }

@@ -39,10 +39,12 @@ import Settings from './components/Settings.vue'
 const store = useRecorderStore()
 const showSettings = ref(false)
 
-onMounted(() => {
-  store.loadRooms()
+onMounted(async () => {
+  await store.loadRooms()
   store.loadTasks()
   store.loadSettings()
+  // 启动时自动刷新所有直播间状态
+  store.refreshAllRooms()
 })
 </script>
 
