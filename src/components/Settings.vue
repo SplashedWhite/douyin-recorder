@@ -42,6 +42,60 @@
 
       <div class="settings-section">
         <div class="section-header">
+          <span class="section-label">自动录制</span>
+          <span class="section-hint">只对房间中已开启自动录制的项目生效</span>
+        </div>
+        <div class="auto-settings-panel">
+          <div class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">开播检测间隔</div>
+              <div class="auto-setting-hint">建议保持 60 秒或更长，降低请求频率</div>
+            </div>
+            <div class="number-setting">
+              <el-input-number
+                v-model="form.auto_check_interval_secs"
+                :min="10"
+                :max="3600"
+                :step="10"
+                controls-position="right"
+              />
+              <span>秒</span>
+            </div>
+          </div>
+          <div class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">单次监控窗口</div>
+              <div class="auto-setting-hint">到期仍未开播时自动停止请求</div>
+            </div>
+            <div class="number-setting">
+              <el-input-number
+                v-model="form.auto_monitor_window_hours"
+                :min="1"
+                :max="24"
+                :step="1"
+                controls-position="right"
+              />
+              <span>小时</span>
+            </div>
+          </div>
+          <div class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">自动录完一场后</div>
+              <div class="auto-setting-hint">仅影响由自动检测启动的录制</div>
+            </div>
+            <el-select v-model="form.auto_disable_after_record" style="width: 142px">
+              <el-option label="关闭自动录制" :value="true" />
+              <el-option label="继续下一窗口" :value="false" />
+            </el-select>
+          </div>
+        </div>
+        <div class="auto-settings-note">
+          未开启自动录制的房间仍只在程序启动和手动刷新时请求状态；录制期间不会轮询。
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header">
           <span class="section-label">录制保存目录</span>
           <span class="section-hint">留空使用默认目录</span>
         </div>
@@ -139,6 +193,9 @@ const form = reactive({
   auto_convert_mp4: false,
   time_format_24h: true,
   time_display_mode: 'absolute',
+  auto_check_interval_secs: 60,
+  auto_monitor_window_hours: 6,
+  auto_disable_after_record: true,
 })
 
 function onOpen() {
@@ -150,6 +207,9 @@ function onOpen() {
   form.auto_convert_mp4 = store.settings.auto_convert_mp4 ?? false
   form.time_format_24h = store.settings.time_format_24h ?? true
   form.time_display_mode = store.settings.time_display_mode || 'absolute'
+  form.auto_check_interval_secs = store.settings.auto_check_interval_secs ?? 60
+  form.auto_monitor_window_hours = store.settings.auto_monitor_window_hours ?? 6
+  form.auto_disable_after_record = store.settings.auto_disable_after_record ?? true
 }
 
 async function onMigrate() {
@@ -189,6 +249,9 @@ async function onSave() {
 <style scoped>
 .settings-body {
   padding: 4px 0;
+  max-height: 66vh;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .settings-section {
@@ -242,6 +305,56 @@ async function onSave() {
 .time-options {
   display: flex;
   gap: 8px;
+}
+
+.auto-settings-panel {
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.auto-setting-row {
+  min-height: 66px;
+  padding: 11px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.auto-setting-row:last-child {
+  border-bottom: none;
+}
+
+.auto-setting-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.auto-setting-hint,
+.auto-settings-note {
+  font-size: 10px;
+  color: var(--color-text-tertiary);
+  line-height: 1.5;
+}
+
+.auto-settings-note {
+  margin-top: 7px;
+}
+
+.number-setting {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+}
+
+.number-setting :deep(.el-input-number) {
+  width: 112px;
 }
 
 .footer-row {

@@ -72,6 +72,27 @@
               <span class="status-dot"></span>
               {{ room.is_live ? '直播中' : '未开播' }}
             </div>
+            <div class="automation-controls">
+              <button
+                class="automation-chip"
+                :class="{ active: room.auto_record_enabled }"
+                :disabled="autoChangingIds.has(room.id)"
+                :title="room.auto_record_enabled ? '关闭后不会停止正在进行的录制' : '开启后按设置的间隔检查开播状态'"
+                @click="toggleAutoRecord(room)"
+              >
+                <el-icon :size="12"><Timer /></el-icon>
+                {{ getAutoRecordText(room) }}
+              </button>
+              <button
+                class="automation-chip schedule"
+                :class="{ active: !!room.auto_record_daily_time }"
+                title="设置每天开启自动录制的时间"
+                @click="openSchedule(room)"
+              >
+                <el-icon :size="12"><Clock /></el-icon>
+                {{ room.auto_record_daily_time ? `每天 ${room.auto_record_daily_time}` : '定时开启' }}
+              </button>
+            </div>
           </div>
 
           <!-- Actions -->
@@ -101,13 +122,59 @@
         </div>
       </TransitionGroup>
     </div>
+
+    <el-dialog
+      v-model="scheduleVisible"
+      :title="`定时开启 · ${scheduleRoom?.anchor_name || '直播间'}`"
+      width="380"
+      append-to-body
+    >
+      <div class="schedule-dialog-body">
+        <div class="schedule-label">每天在此时间开启自动录制</div>
+        <el-time-picker
+          v-model="scheduleTime"
+          format="HH:mm"
+          value-format="HH:mm"
+          placeholder="选择时间"
+          style="width: 100%"
+        />
+        <div class="schedule-hint">
+          到点后会开始一个新的监控窗口；若所选时间今天已经过去，则从明天开始生效。
+        </div>
+      </div>
+      <template #footer>
+        <div class="schedule-footer">
+          <el-button
+            v-if="scheduleRoom?.auto_record_daily_time"
+            type="danger"
+            plain
+            :loading="scheduleSaving"
+            @click="cancelSchedule"
+          >
+            取消定时
+          </el-button>
+          <span v-else></span>
+          <div>
+            <el-button @click="scheduleVisible = false">关闭</el-button>
+            <el-button
+              type="primary"
+              :disabled="!scheduleTime"
+              :loading="scheduleSaving"
+              @click="saveSchedule"
+            >
+              保存
+            </el-button>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
   </el-card>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
-import { Plus, Delete, VideoPlay, VideoPause, Refresh } from '@element-plus/icons-vue'
+import { Plus, Delete, VideoPlay, VideoPause, Refresh, Timer, Clock } from '@element-plus/icons-vue'
 import { useRecorderStore } from '../stores/recorder'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { LiveRoom } from '../types'
@@ -117,6 +184,23 @@ const { rooms, tasks, loading } = storeToRefs(store)
 
 const newUrl = ref('')
 const refreshingIds = ref(new Set<number>())
+const autoChangingIds = ref(new Set<number>())
+const scheduleVisible = ref(false)
+const scheduleRoom = ref<LiveRoom | null>(null)
+const scheduleTime = ref<string | null>(null)
+const scheduleSaving = ref(false)
+const displayNow = ref(Date.now())
+let displayTimer: number | undefined
+
+onMounted(() => {
+  displayTimer = window.setInterval(() => {
+    displayNow.value = Date.now()
+  }, 60_000)
+})
+
+onBeforeUnmount(() => {
+  if (displayTimer !== undefined) window.clearInterval(displayTimer)
+})
 
 function getInitial(name: string) {
   return (name || '?').charAt(0).toUpperCase()
@@ -128,6 +212,63 @@ function getActiveTask(roomId: number) {
 
 function isRecording(roomId: number) {
   return !!getActiveTask(roomId)
+}
+
+function getAutoRecordText(room: LiveRoom) {
+  if (!room.auto_record_enabled) return '自动录制'
+  if (isRecording(room.id)) return '自动录制已开启'
+  if (!room.auto_record_until) return '自动监控中'
+  const remainingMs = new Date(room.auto_record_until).getTime() - displayNow.value
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return '监控即将结束'
+  const minutes = Math.max(1, Math.ceil(remainingMs / 60_000))
+  if (minutes < 60) return `监控剩余 ${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  const rest = minutes % 60
+  return rest ? `监控剩余 ${hours} 小时 ${rest} 分` : `监控剩余 ${hours} 小时`
+}
+
+async function toggleAutoRecord(room: LiveRoom) {
+  autoChangingIds.value.add(room.id)
+  try {
+    await store.setRoomAutoRecord(room.id, !room.auto_record_enabled)
+  } catch (e) {
+    ElMessage.error(`修改自动录制失败: ${e}`)
+  } finally {
+    autoChangingIds.value.delete(room.id)
+  }
+}
+
+function openSchedule(room: LiveRoom) {
+  scheduleRoom.value = room
+  scheduleTime.value = room.auto_record_daily_time
+  scheduleVisible.value = true
+}
+
+async function saveSchedule() {
+  if (!scheduleRoom.value || !scheduleTime.value) return
+  scheduleSaving.value = true
+  try {
+    const updated = await store.setRoomAutoSchedule(scheduleRoom.value.id, scheduleTime.value)
+    scheduleRoom.value = updated
+    scheduleVisible.value = false
+  } catch (e) {
+    ElMessage.error(`保存定时失败: ${e}`)
+  } finally {
+    scheduleSaving.value = false
+  }
+}
+
+async function cancelSchedule() {
+  if (!scheduleRoom.value) return
+  scheduleSaving.value = true
+  try {
+    await store.setRoomAutoSchedule(scheduleRoom.value.id, null)
+    scheduleVisible.value = false
+  } catch (e) {
+    ElMessage.error(`取消定时失败: ${e}`)
+  } finally {
+    scheduleSaving.value = false
+  }
 }
 
 async function toggleRecord(room: LiveRoom) {
@@ -438,6 +579,53 @@ async function deleteRoom(room: LiveRoom) {
   opacity: 1;
 }
 
+.automation-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.automation-chip {
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-full);
+  background: var(--color-surface);
+  color: var(--color-text-tertiary);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: all var(--transition-fast);
+}
+
+.automation-chip:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+
+.automation-chip.active {
+  border-color: transparent;
+  color: var(--color-success);
+  background: var(--color-success-light);
+}
+
+.automation-chip.schedule.active {
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+
+.automation-chip:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 /* ── Actions ── */
 .room-actions {
   display: flex;
@@ -476,6 +664,30 @@ async function deleteRoom(room: LiveRoom) {
 .icon-btn.danger:hover {
   background: var(--color-danger-light);
   color: var(--color-danger);
+}
+
+.schedule-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.schedule-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.schedule-hint {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--color-text-tertiary);
+}
+
+.schedule-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
 /* ── Transition ── */

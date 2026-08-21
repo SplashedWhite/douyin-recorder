@@ -40,6 +40,7 @@
                 <span class="badge-dot"></span>
                 {{ getStatusText(task.status) }}
               </span>
+              <span v-if="task.trigger === 'auto'" class="task-trigger-badge">自动</span>
               <span class="task-time">{{ formatTime(task.start_time) }}</span>
             </div>
             <div class="task-path" v-if="task.file_path">
@@ -57,7 +58,7 @@
               <el-icon :size="15"><VideoPause /></el-icon>
             </button>
             <button
-              v-if="task.status === 'completed' && task.file_path"
+              v-if="canAccessFile(task)"
               class="icon-btn primary"
               @click="openFile(task)"
               title="打开文件"
@@ -65,7 +66,7 @@
               <el-icon :size="15"><FolderOpened /></el-icon>
             </button>
             <button
-              v-if="task.status === 'completed' && task.file_path"
+              v-if="canAccessFile(task)"
               class="icon-btn primary"
               @click="openFolder(task)"
               title="打开文件夹"
@@ -73,7 +74,7 @@
               <el-icon :size="15"><Folder /></el-icon>
             </button>
             <button
-              v-if="task.status === 'completed' && isFlvFile(task)"
+              v-if="canConvert(task)"
               class="icon-btn primary"
               @click="convertToMp4(task)"
               title="转换为 MP4"
@@ -83,6 +84,7 @@
             <button
               class="icon-btn danger"
               @click="deleteTask(task)"
+              :disabled="task.status === 'recording' || task.status === 'finalizing'"
               title="删除任务"
             >
               <el-icon :size="15"><Delete /></el-icon>
@@ -109,7 +111,9 @@ function getStatusText(status: string) {
   const map: Record<string, string> = {
     waiting: '等待中',
     recording: '录制中',
+    finalizing: '结束处理中',
     completed: '已完成',
+    interrupted: '录制中断',
     failed: '失败',
   }
   return map[status] || status
@@ -227,6 +231,14 @@ async function openFolder(task: RecordTask) {
 
 function isFlvFile(task: RecordTask): boolean {
   return !!task.file_path && task.file_path.endsWith('.flv')
+}
+
+function canAccessFile(task: RecordTask): boolean {
+  return !!task.file_path && ['completed', 'interrupted', 'failed'].includes(task.status)
+}
+
+function canConvert(task: RecordTask): boolean {
+  return canAccessFile(task) && isFlvFile(task)
 }
 
 async function convertToMp4(task: RecordTask) {
@@ -352,6 +364,16 @@ async function deleteTask(task: RecordTask) {
   opacity: 0.5;
 }
 
+.task-card.finalizing .task-accent {
+  background: var(--color-primary);
+  opacity: 0.5;
+}
+
+.task-card.interrupted .task-accent {
+  background: var(--color-warning);
+  opacity: 0.7;
+}
+
 .task-card.failed .task-accent {
   background: var(--color-danger);
   opacity: 0.6;
@@ -394,6 +416,16 @@ async function deleteTask(task: RecordTask) {
   color: var(--color-success);
 }
 
+.task-status-badge.finalizing {
+  background: var(--color-primary-light);
+  color: var(--color-primary);
+}
+
+.task-status-badge.interrupted {
+  background: var(--color-warning-light);
+  color: var(--color-warning);
+}
+
 .task-status-badge.failed {
   background: var(--color-danger-light);
   color: var(--color-danger);
@@ -424,6 +456,15 @@ async function deleteTask(task: RecordTask) {
   font-size: 11px;
   color: var(--color-text-tertiary);
   font-variant-numeric: tabular-nums;
+}
+
+.task-trigger-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: var(--radius-full);
+  color: var(--color-primary);
+  background: var(--color-primary-light);
 }
 
 .task-path {
@@ -476,6 +517,12 @@ async function deleteTask(task: RecordTask) {
 .icon-btn.danger:hover {
   background: var(--color-danger-light);
   color: var(--color-danger);
+}
+
+.icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
 }
 
 /* ── Transition ── */

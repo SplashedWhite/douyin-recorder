@@ -12,6 +12,9 @@ pub struct AppSettings {
     pub auto_convert_mp4: bool,
     pub time_format_24h: bool,
     pub time_display_mode: String,
+    pub auto_check_interval_secs: u64,
+    pub auto_monitor_window_hours: u64,
+    pub auto_disable_after_record: bool,
 }
 
 impl Default for AppSettings {
@@ -22,7 +25,10 @@ impl Default for AppSettings {
         let default_recordings = if home.is_empty() {
             String::new()
         } else {
-            std::path::Path::new(&home).join("DouyinRecordings").to_string_lossy().to_string()
+            std::path::Path::new(&home)
+                .join("DouyinRecordings")
+                .to_string_lossy()
+                .to_string()
         };
 
         AppSettings {
@@ -34,6 +40,9 @@ impl Default for AppSettings {
             auto_convert_mp4: false,
             time_format_24h: true,
             time_display_mode: "absolute".to_string(),
+            auto_check_interval_secs: 60,
+            auto_monitor_window_hours: 6,
+            auto_disable_after_record: true,
         }
     }
 }
@@ -71,11 +80,16 @@ pub fn load_settings() -> AppSettings {
 }
 
 pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
+    if !(10..=3600).contains(&settings.auto_check_interval_secs) {
+        return Err("自动录制检测间隔必须在 10 到 3600 秒之间".to_string());
+    }
+    if !(1..=24).contains(&settings.auto_monitor_window_hours) {
+        return Err("自动录制检测窗口必须在 1 到 24 小时之间".to_string());
+    }
     let path = settings_path();
-    let json = serde_json::to_string_pretty(settings)
-        .map_err(|e| format!("序列化设置失败: {}", e))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("保存设置失败: {}", e))?;
+    let json =
+        serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {}", e))?;
+    std::fs::write(&path, json).map_err(|e| format!("保存设置失败: {}", e))?;
     Ok(())
 }
 
@@ -89,13 +103,11 @@ pub fn migrate_db(new_path: &str) -> Result<String, String> {
 
     // Create parent directory
     if let Some(parent) = new_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建目标目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目标目录失败: {}", e))?;
     }
 
     // Copy database file
-    std::fs::copy(&old_path, &new_path)
-        .map_err(|e| format!("复制数据库失败: {}", e))?;
+    std::fs::copy(&old_path, &new_path).map_err(|e| format!("复制数据库失败: {}", e))?;
 
     // Update settings
     let mut settings = load_settings();
@@ -103,4 +115,30 @@ pub fn migrate_db(new_path: &str) -> Result<String, String> {
     save_settings(&settings)?;
 
     Ok(new_path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn legacy_settings_receive_auto_record_defaults() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "proxy": "",
+                "cookie": "",
+                "quality": "HD1",
+                "recordings_dir": "",
+                "db_path": "",
+                "auto_convert_mp4": false,
+                "time_format_24h": true,
+                "time_display_mode": "absolute"
+            }"#,
+        )
+        .expect("deserialize legacy settings");
+
+        assert_eq!(settings.auto_check_interval_secs, 60);
+        assert_eq!(settings.auto_monitor_window_hours, 6);
+        assert!(settings.auto_disable_after_record);
+    }
 }

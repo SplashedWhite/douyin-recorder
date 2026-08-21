@@ -29,7 +29,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { Setting } from '@element-plus/icons-vue'
 import { useRecorderStore } from './stores/recorder'
 import RoomList from './components/RoomList.vue'
@@ -40,11 +40,16 @@ const store = useRecorderStore()
 const showSettings = ref(false)
 
 onMounted(async () => {
+  await store.listenRecordingEvents()
   await store.loadRooms()
   store.loadTasks()
   store.loadSettings()
   // 启动时自动刷新所有直播间状态
   store.refreshAllRooms()
+})
+
+onBeforeUnmount(() => {
+  store.stopListeningRecordingEvents()
 })
 </script>
 
