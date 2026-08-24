@@ -3,6 +3,7 @@ mod database;
 mod parser;
 mod recorder;
 mod settings;
+mod updater;
 
 use auto_recorder::AutoRecorder;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveTime, Utc};
@@ -542,11 +543,27 @@ async fn check_auto_room(app: &AppHandle, room: LiveRoom) -> Result<(), String> 
     let info = match state.parser.parse_douyin_url(&url, &app_settings).await {
         Ok(info) => info,
         Err(error) => {
+            let rate_limited = error.is_rate_limited();
             state.auto_recorder.mark_failure(
                 room.id,
                 app_settings.auto_check_interval_secs,
-                error.is_rate_limited(),
+                rate_limited,
             );
+            if rate_limited {
+                let current_room = {
+                    let db = state.db.lock().map_err(|e| e.to_string())?;
+                    db.get_room(room.id).map_err(|e| e.to_string())?
+                };
+                emit_auto_recording_event(
+                    app,
+                    current_room,
+                    "backoff",
+                    Some(format!(
+                        "开播检测受到抖音限制，已暂停请求 30 分钟后再试: {}",
+                        error
+                    )),
+                );
+            }
             return Ok(());
         }
     };
@@ -771,6 +788,13 @@ fn save_settings_cmd(new_settings: AppSettings) -> Result<(), String> {
 #[tauri::command]
 fn migrate_db_cmd(new_path: String) -> Result<String, String> {
     settings::migrate_db(&new_path)
+}
+
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<Option<updater::UpdateInfo>, String> {
+    let current_version = app.package_info().version.clone();
+    let app_settings = settings::load_settings();
+    updater::check_for_update(&current_version, &app_settings).await
 }
 
 #[tauri::command]
@@ -1053,6 +1077,7 @@ pub fn run() {
             get_settings_cmd,
             save_settings_cmd,
             migrate_db_cmd,
+            check_for_update,
         ])
         .run(tauri::generate_context!())
         .expect("应用启动失败");

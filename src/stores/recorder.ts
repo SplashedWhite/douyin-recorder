@@ -7,6 +7,7 @@ import type {
   LiveRoom,
   RecordTask,
   AppSettings,
+  UpdateInfo,
   RecordingStatusChanged,
   RoomAutoRecordingChanged,
 } from '../types'
@@ -15,6 +16,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   const rooms = ref<LiveRoom[]>([])
   const tasks = ref<RecordTask[]>([])
   const loading = ref(false)
+  const availableUpdate = ref<UpdateInfo | null>(null)
   const settings = ref<AppSettings>({
     proxy: '',
     cookie: '',
@@ -27,6 +29,7 @@ export const useRecorderStore = defineStore('recorder', () => {
     auto_check_interval_secs: 60,
     auto_monitor_window_hours: 6,
     auto_disable_after_record: true,
+    notify_updates: true,
   })
   let unlistenRecordingStatus: UnlistenFn | null = null
   let unlistenAutoRecordingStatus: UnlistenFn | null = null
@@ -74,7 +77,7 @@ export const useRecorderStore = defineStore('recorder', () => {
 
         if (['enabled', 'scheduled', 'schedule_triggered'].includes(payload.reason)) {
           ElMessage.success(payload.message)
-        } else if (payload.reason === 'paused' || payload.reason === 'window_expired') {
+        } else if (payload.reason === 'paused' || payload.reason === 'window_expired' || payload.reason === 'backoff') {
           ElMessage.warning(payload.message)
         } else {
           ElMessage.info(payload.message)
@@ -233,11 +236,32 @@ export const useRecorderStore = defineStore('recorder', () => {
 
   async function saveSettings(newSettings: AppSettings) {
     try {
+      const updateNotificationsWereEnabled = settings.value.notify_updates
       await invoke('save_settings_cmd', { newSettings })
       settings.value = newSettings
+      if (!newSettings.notify_updates) {
+        availableUpdate.value = null
+      } else if (!updateNotificationsWereEnabled) {
+        void checkForUpdate()
+      }
     } catch (e) {
       console.error('保存设置失败:', e)
       throw e
+    }
+  }
+
+  async function checkForUpdate() {
+    if (!settings.value.notify_updates) {
+      availableUpdate.value = null
+      return
+    }
+
+    try {
+      const update = await invoke<UpdateInfo | null>('check_for_update')
+      availableUpdate.value = settings.value.notify_updates ? update : null
+    } catch (e) {
+      availableUpdate.value = null
+      console.debug('检查更新失败，已静默忽略:', e)
     }
   }
 
@@ -253,11 +277,11 @@ export const useRecorderStore = defineStore('recorder', () => {
   }
 
   return {
-    rooms, tasks, loading, settings,
+    rooms, tasks, loading, settings, availableUpdate,
     listenRecordingEvents, stopListeningRecordingEvents,
     loadRooms, addRoom, refreshRoom, refreshAllRooms, setRoomAutoRecord, setRoomAutoSchedule,
     deleteRoom, getRoomTaskCount,
     loadTasks, startRecord, stopRecord, deleteTask, convertToMp4,
-    loadSettings, saveSettings, migrateDb
+    loadSettings, saveSettings, checkForUpdate, migrateDb
   }
 })

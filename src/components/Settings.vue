@@ -138,6 +138,21 @@
 
       <div class="settings-section">
         <div class="section-header">
+          <span class="section-label">更新提醒</span>
+          <span class="section-hint">启动时静默检查 GitHub 最新正式版本</span>
+        </div>
+        <el-switch
+          v-model="form.notify_updates"
+          active-text="开启"
+          inactive-text="关闭"
+        />
+        <div class="update-settings-note">
+          关闭后不会请求 GitHub，也不会显示更新提示。
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header">
           <span class="section-label">数据库位置</span>
           <span class="section-hint hint-warn">数据库极小（<1MB），不建议更改</span>
         </div>
@@ -196,6 +211,7 @@ const form = reactive({
   auto_check_interval_secs: 60,
   auto_monitor_window_hours: 6,
   auto_disable_after_record: true,
+  notify_updates: true,
 })
 
 function onOpen() {
@@ -210,6 +226,7 @@ function onOpen() {
   form.auto_check_interval_secs = store.settings.auto_check_interval_secs ?? 60
   form.auto_monitor_window_hours = store.settings.auto_monitor_window_hours ?? 6
   form.auto_disable_after_record = store.settings.auto_disable_after_record ?? true
+  form.notify_updates = store.settings.notify_updates ?? true
 }
 
 async function onMigrate() {
@@ -334,7 +351,8 @@ async function onSave() {
 }
 
 .auto-setting-hint,
-.auto-settings-note {
+.auto-settings-note,
+.update-settings-note {
   font-size: 10px;
   color: var(--color-text-tertiary);
   line-height: 1.5;
@@ -342,6 +360,10 @@ async function onSave() {
 
 .auto-settings-note {
   margin-top: 7px;
+}
+
+.update-settings-note {
+  margin-top: 6px;
 }
 
 .number-setting {

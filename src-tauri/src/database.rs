@@ -431,6 +431,9 @@ mod tests {
         assert_eq!(interrupted.file_size, Some(19));
         assert_eq!(interrupted.trigger, "manual");
         assert!(interrupted.end_time.is_some());
+        assert!(!db
+            .has_running_tasks_for_room(room_id)
+            .expect("interrupted and failed history must not block another recording"));
 
         let failed = db.get_task(failed_id).expect("read failed task");
         assert_eq!(failed.status, "failed");

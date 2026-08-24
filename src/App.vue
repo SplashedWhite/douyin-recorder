@@ -12,9 +12,24 @@
             </div>
             <h1>抖音直播录制</h1>
           </div>
-          <el-button text circle @click="showSettings = true" class="settings-btn">
-            <el-icon :size="20"><Setting /></el-icon>
-          </el-button>
+          <div class="header-actions">
+            <el-button
+              v-if="store.availableUpdate"
+              type="primary"
+              plain
+              round
+              size="small"
+              class="update-btn"
+              :title="`发现新版本 v${store.availableUpdate.latest_version}`"
+              @click="openLatestRelease"
+            >
+              <el-icon><TopRight /></el-icon>
+              有更新 v{{ store.availableUpdate.latest_version }}
+            </el-button>
+            <el-button text circle @click="showSettings = true" class="settings-btn">
+              <el-icon :size="20"><Setting /></el-icon>
+            </el-button>
+          </div>
         </div>
       </header>
 
@@ -30,7 +45,9 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount } from 'vue'
-import { Setting } from '@element-plus/icons-vue'
+import { Setting, TopRight } from '@element-plus/icons-vue'
+import { openUrl } from '@tauri-apps/plugin-opener'
+import { ElMessage } from 'element-plus'
 import { useRecorderStore } from './stores/recorder'
 import RoomList from './components/RoomList.vue'
 import TaskList from './components/TaskList.vue'
@@ -39,13 +56,27 @@ import Settings from './components/Settings.vue'
 const store = useRecorderStore()
 const showSettings = ref(false)
 
+async function openLatestRelease() {
+  const update = store.availableUpdate
+  if (!update) return
+
+  try {
+    await openUrl(update.release_url)
+  } catch (e) {
+    ElMessage.error(`无法打开更新页面: ${e}`)
+  }
+}
+
 onMounted(async () => {
   await store.listenRecordingEvents()
-  await store.loadRooms()
-  store.loadTasks()
-  store.loadSettings()
-  // 启动时自动刷新所有直播间状态
-  store.refreshAllRooms()
+  await Promise.all([
+    store.loadRooms(),
+    store.loadTasks(),
+    store.loadSettings(),
+  ])
+  void store.checkForUpdate()
+  // 启动时自动刷新未开启自动录制的直播间状态
+  void store.refreshAllRooms()
 })
 
 onBeforeUnmount(() => {
@@ -165,6 +196,17 @@ body {
   font-weight: 600;
   letter-spacing: -0.4px;
   color: var(--color-text);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.update-btn {
+  border-radius: var(--radius-full) !important;
+  padding: 6px 10px !important;
 }
 
 .settings-btn {

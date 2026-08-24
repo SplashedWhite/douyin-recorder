@@ -810,11 +810,12 @@ dependencies = [
 
 [[package]]
 name = "douyin-recorder"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "reqwest 0.12.28",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

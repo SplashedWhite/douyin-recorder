@@ -15,6 +15,7 @@ pub struct AppSettings {
     pub auto_check_interval_secs: u64,
     pub auto_monitor_window_hours: u64,
     pub auto_disable_after_record: bool,
+    pub notify_updates: bool,
 }
 
 impl Default for AppSettings {
@@ -43,6 +44,7 @@ impl Default for AppSettings {
             auto_check_interval_secs: 60,
             auto_monitor_window_hours: 6,
             auto_disable_after_record: true,
+            notify_updates: true,
         }
     }
 }
@@ -140,5 +142,6 @@ mod tests {
         assert_eq!(settings.auto_check_interval_secs, 60);
         assert_eq!(settings.auto_monitor_window_hours, 6);
         assert!(settings.auto_disable_after_record);
+        assert!(settings.notify_updates);
     }
 }

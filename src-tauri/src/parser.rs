@@ -8,6 +8,7 @@ use crate::settings::AppSettings;
 
 const DOUYIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const SESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const DOUYIN_SESSION_REJECTED_STATUS: u16 = 444;
 
 #[derive(Debug, Clone)]
 pub struct LiveInfo {
@@ -38,12 +39,19 @@ impl ParseError {
     }
 
     fn http(status: reqwest::StatusCode) -> Self {
+        let session_rejected = status.as_u16() == DOUYIN_SESSION_REJECTED_STATUS;
         Self {
-            message: format!("抖音 API 返回错误: HTTP {}", status),
+            message: if session_rejected {
+                "抖音 API 拒绝了当前会话: HTTP 444".to_string()
+            } else {
+                format!("抖音 API 返回错误: HTTP {}", status)
+            },
             rate_limited: status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status == reqwest::StatusCode::FORBIDDEN,
+                || status == reqwest::StatusCode::FORBIDDEN
+                || session_rejected,
             authentication_failed: status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN,
+                || status == reqwest::StatusCode::FORBIDDEN
+                || session_rejected,
         }
     }
 
@@ -101,7 +109,7 @@ impl DouyinParser {
             )
             .await;
             match result {
-                Err(error) if error.authentication_failed && attempt == 0 => {
+                Err(error) if should_refresh_session(&error, attempt) => {
                     *session = Some(build_session(settings).await?);
                 }
                 result => return result,
@@ -110,6 +118,10 @@ impl DouyinParser {
 
         Err(ParseError::new("抖音登录会话刷新后仍然无效"))
     }
+}
+
+fn should_refresh_session(error: &ParseError, attempt: usize) -> bool {
+    error.authentication_failed && attempt == 0
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,10 +262,7 @@ async fn request_room(
     room_id: &str,
     settings: &AppSettings,
 ) -> Result<LiveInfo, ParseError> {
-    let mut cookie_value = format!("ttwid={}", session.ttwid);
-    if !settings.cookie.is_empty() {
-        cookie_value = format!("{}; {}", cookie_value, settings.cookie);
-    }
+    let cookie_value = build_cookie_header(&session.ttwid, &settings.cookie);
 
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(DOUYIN_UA));
@@ -345,6 +354,26 @@ async fn request_room(
     })
 }
 
+fn build_cookie_header(ttwid: &str, user_cookie: &str) -> String {
+    let extra_cookies = user_cookie
+        .split(';')
+        .map(str::trim)
+        .filter(|cookie| !cookie.is_empty())
+        .filter(|cookie| {
+            cookie
+                .split_once('=')
+                .map(|(name, _)| !name.trim().eq_ignore_ascii_case("ttwid"))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+
+    if extra_cookies.is_empty() {
+        format!("ttwid={}", ttwid)
+    } else {
+        format!("ttwid={}; {}", ttwid, extra_cookies.join("; "))
+    }
+}
+
 fn get_best_stream_url(stream_url: &StreamUrl, preferred: &str) -> String {
     let fallback_order: Vec<&str> = match preferred {
         "FULL_HD1" => vec!["FULL_HD1", "HD1", "SD1", "SD2"],
@@ -382,4 +411,39 @@ fn get_best_stream_url(stream_url: &StreamUrl, preferred: &str) -> String {
     }
 
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_cookie_header, should_refresh_session, ParseError, DOUYIN_SESSION_REJECTED_STATUS,
+    };
+
+    #[test]
+    fn treats_http_444_as_a_rejected_session_and_rate_limit() {
+        let status = reqwest::StatusCode::from_u16(DOUYIN_SESSION_REJECTED_STATUS)
+            .expect("444 is a representable HTTP status");
+        let error = ParseError::http(status);
+
+        assert!(error.authentication_failed);
+        assert!(error.is_rate_limited());
+        assert!(should_refresh_session(&error, 0));
+        assert!(!should_refresh_session(&error, 1));
+        assert_eq!(error.to_string(), "抖音 API 拒绝了当前会话: HTTP 444");
+    }
+
+    #[test]
+    fn fresh_ttwid_cannot_be_overridden_by_saved_cookie() {
+        assert_eq!(
+            build_cookie_header(
+                "fresh-token",
+                "__ac_nonce=nonce; ttwid=stale-token; sessionid=session"
+            ),
+            "ttwid=fresh-token; __ac_nonce=nonce; sessionid=session"
+        );
+        assert_eq!(
+            build_cookie_header("fresh-token", "TTWID=stale-token"),
+            "ttwid=fresh-token"
+        );
+    }
 }

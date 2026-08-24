@@ -37,6 +37,13 @@ export interface AppSettings {
   auto_check_interval_secs: number
   auto_monitor_window_hours: number
   auto_disable_after_record: boolean
+  notify_updates: boolean
+}
+
+export interface UpdateInfo {
+  current_version: string
+  latest_version: string
+  release_url: string
 }
 
 export interface RecordingStatusChanged {
@@ -48,6 +55,6 @@ export interface RecordingStatusChanged {
 
 export interface RoomAutoRecordingChanged {
   room: LiveRoom
-  reason: 'enabled' | 'disabled' | 'scheduled' | 'schedule_cancelled' | 'schedule_triggered' | 'window_expired' | 'paused'
+  reason: 'enabled' | 'disabled' | 'scheduled' | 'schedule_cancelled' | 'schedule_triggered' | 'window_expired' | 'paused' | 'backoff'
   message: string | null
 }
