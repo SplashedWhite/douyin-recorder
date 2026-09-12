@@ -1,5 +1,6 @@
 mod auto_recorder;
 mod database;
+mod migration;
 mod parser;
 mod recorder;
 mod settings;
@@ -85,14 +86,18 @@ enum AutoPostRecordAction {
 
 fn classify_recording(
     file_size: i64,
-    manually_stopped: bool,
+    exit: &RecordingExit,
     verification: Option<LiveVerification>,
 ) -> &'static str {
     if file_size <= 0 {
         return "failed";
     }
-    if manually_stopped {
-        return "completed";
+    if exit.manually_stopped {
+        return if exit.stopped_cleanly() {
+            "completed"
+        } else {
+            "interrupted"
+        };
     }
     match verification {
         Some(LiveVerification::Offline) => "completed",
@@ -369,11 +374,25 @@ async fn handle_recording_exit(
     };
     emit_recording_event(&app, finalizing_task, None, "finalizing", None);
     #[cfg(debug_assertions)]
-    if !exit.status_success || exit.wait_error.is_some() {
+    {
+        let reason = if exit.forced_stop_reason.is_some() {
+            "manual_stop_forced"
+        } else if exit.manually_stopped && exit.stopped_cleanly() {
+            "manual_stop"
+        } else if exit.manually_stopped {
+            "manual_stop_failed"
+        } else if !exit.stopped_cleanly() {
+            "process_error"
+        } else {
+            "stream_exit"
+        };
         eprintln!(
-            "ffmpeg task {} exited (success: {}, wait_error: {:?}, stderr_lines: {})",
+            "ffmpeg task {} exited (reason: {}, success: {}, exit_code: {:?}, forced_stop: {:?}, wait_error: {:?}, stderr_lines: {})",
             task_id,
+            reason,
             exit.status_success,
+            exit.exit_code,
+            exit.forced_stop_reason,
             exit.wait_error,
             exit.stderr_tail.len()
         );
@@ -395,13 +414,19 @@ async fn handle_recording_exit(
             ),
         }
     };
-    let status = classify_recording(original_size, exit.manually_stopped, verification);
+    let status = classify_recording(original_size, &exit, verification);
     let mut final_path = original_path;
     let mut final_size = original_size;
     let mut message = match status {
         "completed" if exit.manually_stopped => Some("录制已停止".to_string()),
         "completed" => Some("直播已结束，录制已完成".to_string()),
         "failed" => Some("录制已结束，但没有生成有效文件".to_string()),
+        "interrupted" if exit.forced_stop_reason.is_some() => {
+            Some("录制未能正常收尾，已强制停止并保留现有文件，末尾可能不完整".to_string())
+        }
+        "interrupted" if exit.manually_stopped => {
+            Some("录制结束时发生异常，已保留现有文件，请检查末尾是否完整".to_string())
+        }
         _ => verification_message,
     };
     if status == "completed"
@@ -776,18 +801,32 @@ fn reconcile_auto_state_on_startup(
 }
 
 #[tauri::command]
-fn get_settings_cmd() -> Result<AppSettings, String> {
-    Ok(settings::load_settings())
+fn get_settings_cmd(state: State<AppState>) -> Result<AppSettings, String> {
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut current_settings = settings::load_settings();
+    current_settings.db_path = db.path().to_string_lossy().to_string();
+    Ok(current_settings)
 }
 
 #[tauri::command]
-fn save_settings_cmd(new_settings: AppSettings) -> Result<(), String> {
-    settings::save_settings(&new_settings)
+fn save_settings_cmd(
+    state: State<AppState>,
+    new_settings: AppSettings,
+) -> Result<AppSettings, String> {
+    migration::save_settings(&state, new_settings, &settings::settings_path())
 }
 
 #[tauri::command]
-fn migrate_db_cmd(new_path: String) -> Result<String, String> {
-    settings::migrate_db(&new_path)
+async fn migrate_db_cmd(app: AppHandle, new_path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        migration::migrate_database(
+            &app.state::<AppState>(),
+            &new_path,
+            &settings::settings_path(),
+        )
+    })
+    .await
+    .map_err(|e| format!("数据库迁移任务异常: {}", e))?
 }
 
 #[tauri::command]
@@ -1007,6 +1046,8 @@ async fn stop_record(
                 RecordingExit {
                     manually_stopped: true,
                     status_success: false,
+                    exit_code: None,
+                    forced_stop_reason: None,
                     wait_error: Some("未找到对应的 FFmpeg 进程".to_string()),
                     stderr_tail: Vec::new(),
                 },
@@ -1090,6 +1131,7 @@ mod tests {
         initial_schedule_marker, should_poll_auto_room, AutoPostRecordAction, LiveVerification,
     };
     use crate::database::LiveRoom;
+    use crate::recorder::RecordingExit;
     use chrono::{Local, TimeZone};
 
     fn scheduled_room(time: &str, last_date: Option<&str>) -> LiveRoom {
@@ -1110,10 +1152,41 @@ mod tests {
         }
     }
 
+    fn recording_exit(manually_stopped: bool, status_success: bool) -> RecordingExit {
+        RecordingExit {
+            manually_stopped,
+            status_success,
+            exit_code: Some(if status_success { 0 } else { 1 }),
+            forced_stop_reason: None,
+            wait_error: None,
+            stderr_tail: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_clean_manual_stops_complete_nonempty_recordings() {
+        let mut exit = recording_exit(true, true);
+        assert_eq!(classify_recording(1024, &exit, None), "completed");
+        exit.forced_stop_reason = Some("停止超时".to_string());
+        assert_eq!(classify_recording(1024, &exit, None), "interrupted");
+        assert_eq!(classify_recording(0, &exit, None), "failed");
+        exit.forced_stop_reason = None;
+        exit.wait_error = Some("进程等待失败".to_string());
+        assert_eq!(classify_recording(1024, &exit, None), "interrupted");
+        assert_eq!(
+            classify_recording(1024, &recording_exit(true, false), None),
+            "interrupted"
+        );
+    }
+
     #[test]
     fn classifies_natural_offline_exit_as_completed() {
         assert_eq!(
-            classify_recording(1024, false, Some(LiveVerification::Offline)),
+            classify_recording(
+                1024,
+                &recording_exit(false, true),
+                Some(LiveVerification::Offline)
+            ),
             "completed"
         );
     }
@@ -1121,11 +1194,19 @@ mod tests {
     #[test]
     fn classifies_live_or_unverified_exit_as_interrupted() {
         assert_eq!(
-            classify_recording(1024, false, Some(LiveVerification::Live)),
+            classify_recording(
+                1024,
+                &recording_exit(false, true),
+                Some(LiveVerification::Live)
+            ),
             "interrupted"
         );
         assert_eq!(
-            classify_recording(1024, false, Some(LiveVerification::Failed)),
+            classify_recording(
+                1024,
+                &recording_exit(false, true),
+                Some(LiveVerification::Failed)
+            ),
             "interrupted"
         );
     }
@@ -1133,7 +1214,11 @@ mod tests {
     #[test]
     fn classifies_empty_output_as_failed() {
         assert_eq!(
-            classify_recording(0, true, Some(LiveVerification::Offline)),
+            classify_recording(
+                0,
+                &recording_exit(true, true),
+                Some(LiveVerification::Offline)
+            ),
             "failed"
         );
     }

@@ -1,10 +1,11 @@
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, REFERER, USER_AGENT};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-use crate::settings::AppSettings;
+use crate::settings::{normalize_quality, AppSettings};
 
 const DOUYIN_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const SESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -166,6 +167,8 @@ struct StreamUrl {
     flv_pull_url: Option<serde_json::Value>,
     #[serde(rename = "hls_pull_url_map")]
     hls_pull_url_map: Option<serde_json::Value>,
+    // Keep optional SDK fields untyped so malformed SDK data cannot break legacy streams.
+    live_core_sdk_data: Option<serde_json::Value>,
 }
 
 fn extract_room_id(url: &str) -> Result<String, ParseError> {
@@ -331,15 +334,10 @@ async fn request_room(
         .and_then(|avatar| avatar.url_list.as_ref())
         .and_then(|urls| urls.first().cloned())
         .unwrap_or_default();
-    let preferred_quality = if settings.quality.is_empty() {
-        "HD1"
-    } else {
-        &settings.quality
-    };
     let stream_url = room
         .stream_url
         .as_ref()
-        .map(|stream_url| get_best_stream_url(stream_url, preferred_quality))
+        .map(|stream_url| get_best_stream_url(stream_url, &settings.quality))
         .unwrap_or_default();
 
     Ok(LiveInfo {
@@ -375,38 +373,62 @@ fn build_cookie_header(ttwid: &str, user_cookie: &str) -> String {
 }
 
 fn get_best_stream_url(stream_url: &StreamUrl, preferred: &str) -> String {
-    let fallback_order: Vec<&str> = match preferred {
-        "FULL_HD1" => vec!["FULL_HD1", "HD1", "SD1", "SD2"],
-        "SD1" => vec!["SD1", "SD2", "HD1", "FULL_HD1"],
-        "SD2" => vec!["SD2", "SD1", "HD1", "FULL_HD1"],
-        _ => vec!["HD1", "FULL_HD1", "SD1", "SD2"],
-    };
-
-    if let Some(object) = stream_url
-        .flv_pull_url
+    // Descending quality; preserve the four existing settings values.
+    const QUALITIES: [(&str, &str); 5] = [
+        ("ORIGIN", "origin"),
+        ("FULL_HD1", "uhd"),
+        ("HD1", "hd"),
+        ("SD2", "sd"),
+        ("SD1", "ld"),
+    ];
+    let preferred = normalize_quality(preferred);
+    let preferred_index = QUALITIES
+        .iter()
+        .position(|(quality, _)| *quality == preferred)
+        .unwrap_or(0);
+    let sdk_stream_data = stream_url
+        .live_core_sdk_data
         .as_ref()
-        .and_then(|value| value.as_object())
-    {
-        for quality in &fallback_order {
-            if let Some(url) = object.get(*quality).and_then(|value| value.as_str()) {
-                if !url.is_empty() {
-                    return url.to_string();
-                }
-            }
-        }
-    }
+        .and_then(|value| value.get("pull_data"))
+        .and_then(|value| value.get("stream_data"))
+        .and_then(|value| match value {
+            serde_json::Value::String(json) => serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .map(Cow::Owned),
+            serde_json::Value::Object(_) => Some(Cow::Borrowed(value)),
+            _ => None,
+        });
 
-    if let Some(object) = stream_url
-        .hls_pull_url_map
-        .as_ref()
-        .and_then(|value| value.as_object())
+    // Try the requested tier and lower tiers before the nearest higher tier.
+    for &(quality, sdk_key) in QUALITIES[preferred_index..]
+        .iter()
+        .chain(QUALITIES[..preferred_index].iter().rev())
     {
-        for quality in &fallback_order {
-            if let Some(url) = object.get(*quality).and_then(|value| value.as_str()) {
-                if !url.is_empty() {
-                    return url.to_string();
-                }
-            }
+        let sdk_main = sdk_stream_data
+            .as_deref()
+            .and_then(|value| value.get("data"))
+            .and_then(|value| value.get(sdk_key))
+            .and_then(|value| value.get("main"));
+        let candidates = [
+            sdk_main.and_then(|value| value.get("flv")),
+            sdk_main.and_then(|value| value.get("hls")),
+            stream_url
+                .flv_pull_url
+                .as_ref()
+                .and_then(|value| value.get(quality)),
+            stream_url
+                .hls_pull_url_map
+                .as_ref()
+                .and_then(|value| value.get(quality)),
+        ];
+        if let Some(url) = candidates
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str())
+            .map(str::trim)
+            .find(|url| !url.is_empty())
+        {
+            return url.to_string();
         }
     }
 
@@ -416,8 +438,200 @@ fn get_best_stream_url(stream_url: &StreamUrl, preferred: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_cookie_header, should_refresh_session, ParseError, DOUYIN_SESSION_REJECTED_STATUS,
+        build_cookie_header, get_best_stream_url, should_refresh_session, ParseError, StreamUrl,
+        DOUYIN_SESSION_REJECTED_STATUS,
     };
+    use serde_json::{json, Value};
+
+    fn parse_streams(value: Value) -> StreamUrl {
+        serde_json::from_value(value).expect("deserialize sanitized stream response")
+    }
+
+    fn sdk_fixture() -> Value {
+        json!({"data": {
+            "origin": {"main": {"flv": "https://example.com/origin.flv"}},
+            "uhd": {"main": {"flv": "https://example.com/uhd.flv"}},
+            "hd": {"main": {"flv": "https://example.com/hd.flv"}},
+            "sd": {"main": {"flv": "https://example.com/sd.flv"}},
+            "ld": {"main": {"flv": "https://example.com/ld.flv"}}
+        }})
+    }
+
+    #[test]
+    fn selects_all_five_sdk_tiers_from_string_or_object() {
+        let sdk_data = sdk_fixture();
+        for data in [sdk_data.clone(), Value::String(sdk_data.to_string())] {
+            let streams = parse_streams(json!({
+                "live_core_sdk_data": {"pull_data": {"stream_data": data}},
+                "flv_pull_url": {"FULL_HD1": "https://example.com/legacy-blue.flv"}
+            }));
+            for (quality, expected) in [
+                ("ORIGIN", "https://example.com/origin.flv"),
+                ("FULL_HD1", "https://example.com/uhd.flv"),
+                ("HD1", "https://example.com/hd.flv"),
+                ("SD2", "https://example.com/sd.flv"),
+                ("SD1", "https://example.com/ld.flv"),
+            ] {
+                assert_eq!(
+                    get_best_stream_url(&streams, quality),
+                    expected,
+                    "{quality}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_legacy_tiers_and_falls_back_from_origin() {
+        for transport in ["flv_pull_url", "hls_pull_url_map"] {
+            let streams = parse_streams(json!({transport: {
+                "FULL_HD1": "https://example.com/blue",
+                "HD1": "https://example.com/super",
+                "SD2": "https://example.com/high",
+                "SD1": "https://example.com/standard"
+            }}));
+            for (quality, expected) in [
+                ("ORIGIN", "https://example.com/blue"),
+                ("FULL_HD1", "https://example.com/blue"),
+                ("HD1", "https://example.com/super"),
+                ("SD2", "https://example.com/high"),
+                ("SD1", "https://example.com/standard"),
+            ] {
+                assert_eq!(
+                    get_best_stream_url(&streams, quality),
+                    expected,
+                    "{transport}/{quality}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn follows_fallback_order_for_every_available_tier_combination() {
+        let tiers = ["origin", "uhd", "hd", "sd", "ld"];
+        let orders = [
+            ("ORIGIN", ["origin", "uhd", "hd", "sd", "ld"]),
+            ("FULL_HD1", ["uhd", "hd", "sd", "ld", "origin"]),
+            ("HD1", ["hd", "sd", "ld", "uhd", "origin"]),
+            ("SD2", ["sd", "ld", "hd", "uhd", "origin"]),
+            ("SD1", ["ld", "sd", "hd", "uhd", "origin"]),
+        ];
+        for mask in 0..32 {
+            let mut data = sdk_fixture();
+            let available = data["data"].as_object_mut().unwrap();
+            for (index, tier) in tiers.iter().enumerate() {
+                if mask & (1 << index) == 0 {
+                    available.remove(*tier);
+                }
+            }
+            for (quality, order) in orders {
+                let expected = order
+                    .iter()
+                    .find(|tier| data["data"].get(**tier).is_some())
+                    .map(|tier| format!("https://example.com/{tier}.flv"))
+                    .unwrap_or_default();
+                let streams = parse_streams(json!({
+                    "live_core_sdk_data": {"pull_data": {"stream_data": data}}
+                }));
+                assert_eq!(
+                    get_best_stream_url(&streams, quality),
+                    expected,
+                    "mask={mask}, {quality}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exhausts_same_tier_sources_before_using_lower_quality() {
+        let mut response = json!({
+            "live_core_sdk_data": {"pull_data": {"stream_data": {"data": {
+                "hd": {"main": {
+                    "flv": "https://example.com/sdk-hd.flv",
+                    "hls": "https://example.com/sdk-hd.m3u8"
+                }},
+                "sd": {"main": {"flv": "https://example.com/sdk-sd.flv"}}
+            }}}},
+            "flv_pull_url": {"HD1": "https://example.com/legacy-hd.flv"},
+            "hls_pull_url_map": {"HD1": "https://example.com/legacy-hd.m3u8"}
+        });
+        for (field, expected) in [
+            (
+                "/live_core_sdk_data/pull_data/stream_data/data/hd/main/flv",
+                "https://example.com/sdk-hd.flv",
+            ),
+            (
+                "/live_core_sdk_data/pull_data/stream_data/data/hd/main/hls",
+                "https://example.com/sdk-hd.m3u8",
+            ),
+            ("/flv_pull_url/HD1", "https://example.com/legacy-hd.flv"),
+            (
+                "/hls_pull_url_map/HD1",
+                "https://example.com/legacy-hd.m3u8",
+            ),
+        ] {
+            assert_eq!(
+                get_best_stream_url(&parse_streams(response.clone()), "HD1"),
+                expected
+            );
+            *response.pointer_mut(field).unwrap() = json!(" \t");
+        }
+        assert_eq!(
+            get_best_stream_url(&parse_streams(response), "HD1"),
+            "https://example.com/sdk-sd.flv"
+        );
+    }
+
+    #[test]
+    fn malformed_sdk_data_does_not_block_legacy_streams() {
+        for sdk in [
+            Value::Null,
+            json!("unexpected SDK type"),
+            json!({"pull_data": []}),
+            json!({"pull_data": {"stream_data": "{broken json"}}),
+            json!({"pull_data": {"stream_data": 42}}),
+            json!({"pull_data": {"stream_data": "null"}}),
+            json!({"pull_data": {"stream_data": {"data": {"hd": {"main": {"flv": {}, "hls": null}}}}}}),
+        ] {
+            let streams = parse_streams(json!({
+                "live_core_sdk_data": sdk,
+                "hls_pull_url_map": {"HD1": "https://example.com/legacy.m3u8"}
+            }));
+            assert_eq!(
+                get_best_stream_url(&streams, "HD1"),
+                "https://example.com/legacy.m3u8"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_empty_urls_and_internal_sdk_tiers() {
+        let streams = parse_streams(json!({
+            "live_core_sdk_data": {"pull_data": {"stream_data": {"data": {
+                "origin": {"main": {"flv": "", "hls": "  "}},
+                "hd": {"main": {"flv": false}},
+                "md": {"main": {"flv": "https://example.com/internal-low.flv"}},
+                "ao": {"main": {"flv": "https://example.com/audio.flv"}}
+            }}}},
+            "flv_pull_url": {"FULL_HD1": null, "SD2": ""},
+            "hls_pull_url_map": {"SD1": "\t"}
+        }));
+        assert!(get_best_stream_url(&streams, "ORIGIN").is_empty());
+        assert!(get_best_stream_url(&parse_streams(json!({})), "HD1").is_empty());
+    }
+
+    #[test]
+    fn empty_and_unknown_preferences_use_origin() {
+        let streams = parse_streams(json!({
+            "live_core_sdk_data": {"pull_data": {"stream_data": sdk_fixture()}}
+        }));
+        for preference in ["", " \t\n", "invalid-quality"] {
+            assert_eq!(
+                get_best_stream_url(&streams, preference),
+                "https://example.com/origin.flv"
+            );
+        }
+    }
 
     #[test]
     fn treats_http_444_as_a_rejected_session_and_rate_limit() {

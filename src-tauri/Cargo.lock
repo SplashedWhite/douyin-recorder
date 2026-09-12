@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "douyin-recorder"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "reqwest 0.12.28",
@@ -821,6 +821,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
 ]
 

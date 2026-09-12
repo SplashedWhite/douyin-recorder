@@ -1,11 +1,30 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+pub const DEFAULT_QUALITY: &str = "ORIGIN";
+
+pub fn normalize_quality(quality: &str) -> &str {
+    match quality.trim() {
+        "ORIGIN" | "FULL_HD1" | "HD1" | "SD2" | "SD1" => quality.trim(),
+        _ => DEFAULT_QUALITY,
+    }
+}
+
+fn deserialize_quality<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let quality = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(normalize_quality(&quality).to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub proxy: String,
     pub cookie: String,
+    #[serde(deserialize_with = "deserialize_quality")]
     pub quality: String,
     pub recordings_dir: String,
     pub db_path: String,
@@ -35,7 +54,7 @@ impl Default for AppSettings {
         AppSettings {
             proxy: String::new(),
             cookie: String::new(),
-            quality: "HD1".to_string(),
+            quality: DEFAULT_QUALITY.to_string(),
             recordings_dir: default_recordings,
             db_path: String::new(),
             auto_convert_mp4: false,
@@ -60,7 +79,7 @@ pub fn default_db_path() -> PathBuf {
     default_db_dir().join("douyin_recorder.db")
 }
 
-fn settings_path() -> PathBuf {
+pub fn settings_path() -> PathBuf {
     default_db_dir().join("settings.json")
 }
 
@@ -74,54 +93,106 @@ pub fn get_db_path() -> PathBuf {
 }
 
 pub fn load_settings() -> AppSettings {
-    let path = settings_path();
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => AppSettings::default(),
+    load_settings_from(&settings_path()).unwrap_or_default()
+}
+
+pub fn load_settings_from(path: &Path) -> Result<AppSettings, String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).map_err(|e| format!("读取设置失败: {}", e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AppSettings::default()),
+        Err(e) => Err(format!("读取设置失败: {}", e)),
     }
 }
 
-pub fn save_settings(settings: &AppSettings) -> Result<(), String> {
+pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), String> {
     if !(10..=3600).contains(&settings.auto_check_interval_secs) {
         return Err("自动录制检测间隔必须在 10 到 3600 秒之间".to_string());
     }
     if !(1..=24).contains(&settings.auto_monitor_window_hours) {
         return Err("自动录制检测窗口必须在 1 到 24 小时之间".to_string());
     }
-    let path = settings_path();
     let json =
         serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {}", e))?;
-    std::fs::write(&path, json).map_err(|e| format!("保存设置失败: {}", e))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建设置目录失败: {}", e))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("创建临时设置文件失败: {}", e))?;
+    temporary
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("保存设置失败: {}", e))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|e| format!("同步设置失败: {}", e))?;
+    temporary
+        .persist(path)
+        .map_err(|e| format!("替换设置文件失败: {}", e.error))?;
     Ok(())
-}
-
-pub fn migrate_db(new_path: &str) -> Result<String, String> {
-    let old_path = default_db_path();
-    let new_path = PathBuf::from(new_path);
-
-    if !old_path.exists() {
-        return Err("当前数据库文件不存在".to_string());
-    }
-
-    // Create parent directory
-    if let Some(parent) = new_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建目标目录失败: {}", e))?;
-    }
-
-    // Copy database file
-    std::fs::copy(&old_path, &new_path).map_err(|e| format!("复制数据库失败: {}", e))?;
-
-    // Update settings
-    let mut settings = load_settings();
-    settings.db_path = new_path.to_string_lossy().to_string();
-    save_settings(&settings)?;
-
-    Ok(new_path.to_string_lossy().to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AppSettings;
+    use super::{load_settings_from, save_settings_at, AppSettings};
+
+    #[test]
+    fn new_missing_and_invalid_quality_settings_use_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert_eq!(AppSettings::default().quality, "ORIGIN");
+        assert_eq!(load_settings_from(&path).unwrap().quality, "ORIGIN");
+        for content in [
+            "{}",
+            r#"{"quality":""}"#,
+            r#"{"quality":"  \t"}"#,
+            r#"{"quality":"unknown"}"#,
+            r#"{"quality":null}"#,
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let settings = load_settings_from(&path).unwrap();
+            assert_eq!(settings.quality, "ORIGIN", "{content}");
+            save_settings_at(&settings, &path).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["quality"], "ORIGIN");
+        }
+    }
+
+    #[test]
+    fn saved_quality_values_survive_loading_and_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for quality in ["ORIGIN", "FULL_HD1", "HD1", "SD2", "SD1"] {
+            std::fs::write(&path, serde_json::json!({"quality": quality}).to_string()).unwrap();
+            let settings = load_settings_from(&path).unwrap();
+            assert_eq!(settings.quality, quality);
+            save_settings_at(&settings, &path).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["quality"], quality);
+        }
+    }
+
+    #[test]
+    fn atomic_save_replaces_existing_settings_and_invalid_save_preserves_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config/settings.json");
+        let mut settings = AppSettings::default();
+        save_settings_at(&settings, &path).unwrap();
+        settings.db_path = "new.db".to_string();
+        save_settings_at(&settings, &path).unwrap();
+        assert_eq!(load_settings_from(&path).unwrap().db_path, "new.db");
+        let before = std::fs::read(&path).unwrap();
+        settings.auto_check_interval_secs = 0;
+        assert!(save_settings_at(&settings, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
 
     #[test]
     fn legacy_settings_receive_auto_record_defaults() {

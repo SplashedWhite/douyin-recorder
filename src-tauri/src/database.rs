@@ -1,5 +1,6 @@
 use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LiveRoom {
@@ -32,6 +33,7 @@ pub struct RecordTask {
 
 pub struct Database {
     conn: Connection,
+    path: PathBuf,
 }
 
 impl Database {
@@ -42,9 +44,104 @@ impl Database {
             })?;
         }
         let conn = Connection::open(db_path)?;
-        let db = Database { conn };
+        let path = std::fs::canonicalize(db_path)
+            .map_err(|_| rusqlite::Error::InvalidPath(db_path.to_path_buf()))?;
+        let db = Database { conn, path };
         db.init_tables()?;
         Ok(db)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn has_running_tasks(&self) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM record_tasks WHERE status IN ('recording', 'finalizing'))",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// The caller holds the database lock until the new connection replaces this one.
+    pub fn migrate_to<F>(&mut self, new_path: &str, persist_path: F) -> Result<String, String>
+    where
+        F: FnOnce(&Path) -> Result<(), String>,
+    {
+        if self.has_running_tasks().map_err(|e| e.to_string())? {
+            return Err("有任务正在录制或结束处理中，请等待结束后再迁移数据库".to_string());
+        }
+        if new_path.trim().is_empty() {
+            return Err("迁移目标路径不能为空".to_string());
+        }
+        let target = PathBuf::from(new_path);
+        if std::fs::canonicalize(&target).ok().as_ref() == Some(&self.path) {
+            return Err("迁移目标就是当前数据库".to_string());
+        }
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => return Err("迁移目标已存在，请选择一个尚不存在的数据库文件".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("检查迁移目标失败: {}", e)),
+        }
+        if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目标目录失败: {}", e))?;
+        }
+        // Reserve exclusively so an existing file can never be overwritten or cleaned up.
+        let reservation = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| format!("创建目标数据库失败: {}", e))?;
+        drop(reservation);
+        let prepared = (|| {
+            let mut conn =
+                Connection::open(&target).map_err(|e| format!("打开目标数据库失败: {}", e))?;
+            {
+                let backup = rusqlite::backup::Backup::new(&self.conn, &mut conn)
+                    .map_err(|e| format!("创建数据库备份失败: {}", e))?;
+                match backup
+                    .step(-1)
+                    .map_err(|e| format!("备份数据库失败: {}", e))?
+                {
+                    rusqlite::backup::StepResult::Done => {}
+                    _ => return Err("数据库正被占用，备份未完成，请稍后重试".to_string()),
+                }
+            }
+            let check: String = conn
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .map_err(|e| format!("验证数据库备份失败: {}", e))?;
+            if check != "ok" {
+                return Err(format!("数据库备份完整性检查失败: {}", check));
+            }
+            let path =
+                std::fs::canonicalize(&target).map_err(|e| format!("解析目标路径失败: {}", e))?;
+            let replacement = Database { conn, path };
+            replacement
+                .get_all_rooms()
+                .map_err(|e| format!("验证房间数据失败: {}", e))?;
+            replacement
+                .get_all_tasks()
+                .map_err(|e| format!("验证任务数据失败: {}", e))?;
+            persist_path(&replacement.path)?;
+            Ok(replacement)
+        })();
+        match prepared {
+            Ok(replacement) => {
+                // No fallible operations after the settings have committed.
+                *self = replacement;
+                Ok(self.path.to_string_lossy().to_string())
+            }
+            Err(error) => {
+                // The failed replacement connection is closed before removing our new file.
+                if let Err(cleanup) = std::fs::remove_file(&target) {
+                    return Err(format!(
+                        "{}；清理未完成的目标数据库失败: {}",
+                        error, cleanup
+                    ));
+                }
+                Err(error)
+            }
+        }
     }
 
     fn init_tables(&self) -> Result<()> {
@@ -393,6 +490,76 @@ mod tests {
     use super::Database;
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn migration_includes_committed_data_still_in_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let target = dir.path().join("target.db");
+        let mut db = Database::new(&source).unwrap();
+        db.conn
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let room = db
+            .add_room_full("douyin", "wal-room", "anchor", "title", "", "", false)
+            .unwrap();
+        assert!(
+            std::fs::metadata(dir.path().join("source.db-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        db.migrate_to(target.to_str().unwrap(), |_| Ok(())).unwrap();
+        assert_eq!(db.get_room(room).unwrap().room_id, "wal-room");
+        drop(db);
+        let reopened = Database::new(&target).unwrap();
+        assert_eq!(reopened.get_room(room).unwrap().room_id, "wal-room");
+    }
+
+    #[test]
+    fn backup_lock_failure_does_not_persist_path_or_leave_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let target = dir.path().join("target.db");
+        let mut db = Database::new(&source).unwrap();
+        let original_path = db.path().to_path_buf();
+        // A write transaction on the source makes sqlite3_backup_step return LOCKED.
+        db.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut saved = false;
+        let result = db.migrate_to(target.to_str().unwrap(), |_| {
+            saved = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!saved);
+        assert!(!target.exists());
+        assert_eq!(db.path(), original_path);
+        db.conn.execute_batch("ROLLBACK").unwrap();
+        db.add_room_full("douyin", "still-writable", "anchor", "title", "", "", false)
+            .unwrap();
+        db.migrate_to(target.to_str().unwrap(), |_| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn persistence_failure_rolls_back_migration_and_allows_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let target = dir.path().join("target.db");
+        let mut db = Database::new(&source).unwrap();
+        let original_path = db.path().to_path_buf();
+        assert_eq!(
+            db.migrate_to(target.to_str().unwrap(), |_| Err("save failed".to_string()))
+                .unwrap_err(),
+            "save failed"
+        );
+        assert_eq!(db.path(), original_path);
+        assert!(!target.exists());
+        let room = db
+            .add_room_full("douyin", "after-failure", "anchor", "title", "", "", false)
+            .unwrap();
+        db.migrate_to(target.to_str().unwrap(), |_| Ok(())).unwrap();
+        assert_eq!(db.get_room(room).unwrap().room_id, "after-failure");
+    }
 
     #[test]
     fn reconciles_stale_recordings_from_file_state() {

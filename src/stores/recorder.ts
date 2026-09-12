@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { ElMessage } from 'element-plus'
+import { DEFAULT_QUALITY } from '../constants/quality'
 import type {
   LiveRoom,
   RecordTask,
@@ -20,7 +21,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   const settings = ref<AppSettings>({
     proxy: '',
     cookie: '',
-    quality: 'HD1',
+    quality: DEFAULT_QUALITY,
     recordings_dir: '',
     db_path: '',
     auto_convert_mp4: false,
@@ -198,6 +199,7 @@ export const useRecorderStore = defineStore('recorder', () => {
     try {
       const updated = await invoke<RecordTask>('stop_record', { taskId })
       upsertTask(updated)
+      return updated
     } catch (e) {
       console.error('停止录制失败:', e)
       throw e
@@ -237,9 +239,9 @@ export const useRecorderStore = defineStore('recorder', () => {
   async function saveSettings(newSettings: AppSettings) {
     try {
       const updateNotificationsWereEnabled = settings.value.notify_updates
-      await invoke('save_settings_cmd', { newSettings })
-      settings.value = newSettings
-      if (!newSettings.notify_updates) {
+      const savedSettings = await invoke<AppSettings>('save_settings_cmd', { newSettings })
+      settings.value = savedSettings
+      if (!savedSettings.notify_updates) {
         availableUpdate.value = null
       } else if (!updateNotificationsWereEnabled) {
         void checkForUpdate()

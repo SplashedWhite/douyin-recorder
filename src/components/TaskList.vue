@@ -198,8 +198,8 @@ function formatTime(time: string) {
 
 async function stopRecord(task: RecordTask) {
   try {
-    await store.stopRecord(task.id)
-    ElMessage.success('录制已停止')
+    const updated = await store.stopRecord(task.id)
+    if (updated.status === 'completed') ElMessage.success('录制已停止')
   } catch (e) {
     ElMessage.error(`停止失败: ${e}`)
   }

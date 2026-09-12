@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" title="设置" width="460" :show-close="true" @open="onOpen">
+  <el-dialog v-model="visible" title="设置" width="460" :show-close="!migrating" :close-on-click-modal="!migrating" :close-on-press-escape="!migrating" @open="onOpen">
     <div class="settings-body">
       <div class="settings-section">
         <div class="section-header">
@@ -30,14 +30,13 @@
       <div class="settings-section">
         <div class="section-header">
           <span class="section-label">画质偏好</span>
-          <span class="section-hint">不可用时自动降级</span>
         </div>
         <el-select v-model="form.quality" size="large" style="width: 100%">
-          <el-option label="高清 (HD1)" value="HD1" />
-          <el-option label="蓝光 (FULL_HD1)" value="FULL_HD1" />
-          <el-option label="标清 (SD1)" value="SD1" />
-          <el-option label="流畅 (SD2)" value="SD2" />
+          <el-option v-for="option in QUALITY_OPTIONS" :key="option.value" :label="option.label" :value="option.value" />
         </el-select>
+        <div class="quality-note">
+          优先录制所选画质，不可用时自动选择其他档位。实际清晰度由直播间提供。
+        </div>
       </div>
 
       <div class="settings-section">
@@ -154,21 +153,25 @@
       <div class="settings-section">
         <div class="section-header">
           <span class="section-label">数据库位置</span>
-          <span class="section-hint hint-warn">数据库极小（<1MB），不建议更改</span>
+          <span class="section-hint">迁移完成后立即生效，原数据库保留</span>
         </div>
         <div class="db-row">
           <el-input
-            v-model="form.db_path"
+            v-model="migrationTarget"
             placeholder="D:\Data\douyin_recorder.db"
+            :disabled="migrating || saving"
             clearable
             size="large"
           />
-          <el-button size="large" @click="onMigrate" :loading="migrating" :disabled="!form.db_path">
+          <el-button size="large" @click="onMigrate" :loading="migrating" :disabled="!migrationTarget.trim() || saving || hasRunningTasks">
             迁移
           </el-button>
         </div>
         <div class="db-current" v-if="store.settings.db_path">
           当前: {{ store.settings.db_path }}
+        </div>
+        <div class="db-current hint-warn" v-if="hasRunningTasks">
+          有任务正在录制或结束处理中，请等待结束后再迁移。
         </div>
       </div>
     </div>
@@ -177,8 +180,8 @@
       <div class="footer-row">
         <span class="version-text">v{{ version }}</span>
         <div>
-          <el-button @click="visible = false">取消</el-button>
-          <el-button type="primary" @click="onSave" :loading="saving">保存</el-button>
+          <el-button @click="visible = false" :disabled="migrating">取消</el-button>
+          <el-button type="primary" @click="onSave" :loading="saving" :disabled="migrating">保存</el-button>
         </div>
       </div>
     </template>
@@ -186,8 +189,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive } from 'vue'
+import { computed, ref, reactive } from 'vue'
 import { useRecorderStore } from '../stores/recorder'
+import { DEFAULT_QUALITY, QUALITY_OPTIONS, normalizeQuality } from '../constants/quality'
 import { getVersion } from '@tauri-apps/api/app'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -195,6 +199,10 @@ const visible = defineModel<boolean>({ default: false })
 const store = useRecorderStore()
 const saving = ref(false)
 const migrating = ref(false)
+const migrationTarget = ref('')
+const hasRunningTasks = computed(() => store.tasks.some(task =>
+  task.status === 'recording' || task.status === 'finalizing'
+))
 const version = ref('')
 
 getVersion().then(v => { version.value = v })
@@ -202,9 +210,8 @@ getVersion().then(v => { version.value = v })
 const form = reactive({
   proxy: '',
   cookie: '',
-  quality: 'HD1',
+  quality: DEFAULT_QUALITY,
   recordings_dir: '',
-  db_path: '',
   auto_convert_mp4: false,
   time_format_24h: true,
   time_display_mode: 'absolute',
@@ -217,9 +224,9 @@ const form = reactive({
 function onOpen() {
   form.proxy = store.settings.proxy
   form.cookie = store.settings.cookie
-  form.quality = store.settings.quality || 'HD1'
+  form.quality = normalizeQuality(store.settings.quality)
   form.recordings_dir = store.settings.recordings_dir || ''
-  form.db_path = store.settings.db_path || ''
+  migrationTarget.value = ''
   form.auto_convert_mp4 = store.settings.auto_convert_mp4 ?? false
   form.time_format_24h = store.settings.time_format_24h ?? true
   form.time_display_mode = store.settings.time_display_mode || 'absolute'
@@ -230,18 +237,20 @@ function onOpen() {
 }
 
 async function onMigrate() {
-  if (!form.db_path) return
+  if (migrating.value || saving.value || hasRunningTasks.value || !migrationTarget.value.trim()) return
+  const newPath = migrationTarget.value.trim()
+  migrating.value = true
   try {
     await ElMessageBox.confirm(
-      '迁移会将当前数据库复制到新位置，重启后生效。确定继续？',
+      '迁移会将当前数据库复制到新位置，完成后立即生效，原数据库保留。确定继续？',
       '迁移数据库',
       { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' }
     )
-    migrating.value = true
-    await store.migrateDb(form.db_path)
-    ElMessage.success('数据库已迁移，重启后生效')
+    await store.migrateDb(newPath)
+    migrationTarget.value = ''
+    ElMessage.success('数据库已迁移并立即生效，原数据库已保留')
   } catch (e: any) {
-    if (e !== 'cancel') {
+    if (e !== 'cancel' && e !== 'close') {
       ElMessage.error(`迁移失败: ${e}`)
     }
   } finally {
@@ -250,9 +259,10 @@ async function onMigrate() {
 }
 
 async function onSave() {
+  if (migrating.value || saving.value) return
   saving.value = true
   try {
-    await store.saveSettings({ ...form })
+    await store.saveSettings({ ...form, db_path: store.settings.db_path })
     ElMessage.success('设置已保存')
     visible.value = false
   } catch (e) {
@@ -296,6 +306,13 @@ async function onSave() {
 .section-hint {
   font-size: 11px;
   color: var(--color-text-tertiary);
+}
+
+.quality-note {
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  line-height: 1.5;
 }
 
 .hint-warn {

@@ -275,8 +275,8 @@ async function toggleRecord(room: LiveRoom) {
   const activeTask = getActiveTask(room.id)
   if (activeTask) {
     try {
-      await store.stopRecord(activeTask.id)
-      ElMessage.success('录制已停止')
+      const updated = await store.stopRecord(activeTask.id)
+      if (updated.status === 'completed') ElMessage.success('录制已停止')
     } catch (e) {
       ElMessage.error(`停止失败: ${e}`)
     }
