@@ -6,6 +6,16 @@
           <span class="title-text">监控房间</span>
           <span class="title-count" v-if="rooms.length">{{ rooms.length }}</span>
         </div>
+        <button
+          type="button"
+          class="icon-btn"
+          @click="refreshAllRooms"
+          :disabled="isRefreshingAll"
+          title="统一刷新"
+          aria-label="统一刷新"
+        >
+          <el-icon :size="15" :class="{ 'is-loading': isRefreshingAll }"><Refresh /></el-icon>
+        </button>
       </div>
     </template>
 
@@ -110,7 +120,7 @@
             <button
               class="icon-btn"
               @click="refreshRoom(room)"
-              :disabled="refreshingIds.has(room.id)"
+              :disabled="isRefreshingAll || refreshingIds.has(room.id)"
               title="刷新状态"
             >
               <el-icon :size="15" :class="{ 'is-loading': refreshingIds.has(room.id) }"><Refresh /></el-icon>
@@ -180,7 +190,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { LiveRoom } from '../types'
 
 const store = useRecorderStore()
-const { rooms, tasks, loading } = storeToRefs(store)
+const { rooms, tasks, loading, isRefreshingAll } = storeToRefs(store)
 
 const newUrl = ref('')
 const refreshingIds = ref(new Set<number>())
@@ -291,6 +301,7 @@ async function toggleRecord(room: LiveRoom) {
 }
 
 async function refreshRoom(room: LiveRoom) {
+  if (isRefreshingAll.value || refreshingIds.value.has(room.id)) return
   refreshingIds.value.add(room.id)
   try {
     await store.refreshRoom(room.id)
@@ -299,6 +310,24 @@ async function refreshRoom(room: LiveRoom) {
     ElMessage.error(`刷新失败: ${e}`)
   } finally {
     refreshingIds.value.delete(room.id)
+  }
+}
+
+async function refreshAllRooms() {
+  if (isRefreshingAll.value) return
+  try {
+    const result = await store.refreshAllRooms()
+    if (result.total === 0) {
+      ElMessage.info('暂无房间，请先添加直播间。')
+    } else if (result.eligible === 0) {
+      ElMessage.info('所有房间均已开启自动录制，无需手动刷新。')
+    } else if (result.failed > 0) {
+      ElMessage.warning(`刷新完成：成功 ${result.succeeded} 个，失败 ${result.failed} 个。`)
+    } else {
+      ElMessage.success(`已刷新 ${result.succeeded} 个房间。`)
+    }
+  } catch (e) {
+    ElMessage.error(`刷新失败: ${e}`)
   }
 }
 
@@ -656,9 +685,14 @@ async function deleteRoom(room: LiveRoom) {
   transition: all var(--transition-fast);
 }
 
-.icon-btn:hover {
+.icon-btn:hover:not(:disabled) {
   background: var(--color-bg);
   color: var(--color-text-secondary);
+}
+
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .icon-btn.danger:hover {

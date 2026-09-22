@@ -13,10 +13,18 @@ import type {
   RoomAutoRecordingChanged,
 } from '../types'
 
+interface RoomRefreshResult {
+  total: number
+  eligible: number
+  succeeded: number
+  failed: number
+}
+
 export const useRecorderStore = defineStore('recorder', () => {
   const rooms = ref<LiveRoom[]>([])
   const tasks = ref<RecordTask[]>([])
   const loading = ref(false)
+  const isRefreshingAll = ref(false)
   const availableUpdate = ref<UpdateInfo | null>(null)
   const settings = ref<AppSettings>({
     proxy: '',
@@ -34,6 +42,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   })
   let unlistenRecordingStatus: UnlistenFn | null = null
   let unlistenAutoRecordingStatus: UnlistenFn | null = null
+  let refreshAllPromise: Promise<RoomRefreshResult> | null = null
 
   function upsertTask(task: RecordTask) {
     const index = tasks.value.findIndex(item => item.id === task.id)
@@ -129,16 +138,32 @@ export const useRecorderStore = defineStore('recorder', () => {
     }
   }
 
-  async function refreshAllRooms() {
-    const results = await Promise.allSettled(
-      rooms.value
-        .filter(room => !room.auto_record_enabled)
-        .map(room => refreshRoom(room.id))
-    )
-    const failed = results.filter(r => r.status === 'rejected').length
-    if (failed > 0) {
-      console.warn(`批量刷新完成，${failed} 个房间刷新失败`)
+  function refreshAllRooms(): Promise<RoomRefreshResult> {
+    if (refreshAllPromise) return refreshAllPromise
+
+    const total = rooms.value.length
+    const roomIds = rooms.value
+      .filter(room => !room.auto_record_enabled)
+      .map(room => room.id)
+    const eligible = roomIds.length
+    if (eligible === 0) {
+      return Promise.resolve({ total, eligible, succeeded: 0, failed: 0 })
     }
+
+    isRefreshingAll.value = true
+    refreshAllPromise = Promise.allSettled(roomIds.map(roomId => refreshRoom(roomId)))
+      .then(results => {
+        const failed = results.filter(result => result.status === 'rejected').length
+        if (failed > 0) {
+          console.warn(`批量刷新完成，${failed} 个房间刷新失败`)
+        }
+        return { total, eligible, succeeded: eligible - failed, failed }
+      })
+      .finally(() => {
+        refreshAllPromise = null
+        isRefreshingAll.value = false
+      })
+    return refreshAllPromise
   }
 
   async function setRoomAutoRecord(roomId: number, enabled: boolean): Promise<LiveRoom> {
@@ -279,7 +304,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   }
 
   return {
-    rooms, tasks, loading, settings, availableUpdate,
+    rooms, tasks, loading, isRefreshingAll, settings, availableUpdate,
     listenRecordingEvents, stopListeningRecordingEvents,
     loadRooms, addRoom, refreshRoom, refreshAllRooms, setRoomAutoRecord, setRoomAutoSchedule,
     deleteRoom, getRoomTaskCount,
