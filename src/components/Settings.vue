@@ -122,13 +122,29 @@
       <div class="settings-section">
         <div class="section-header">
           <span class="section-label">自动转换 MP4</span>
-          <span class="section-hint">录制完成后自动将 FLV 转为 MP4 格式</span>
+          <span class="section-hint">每段录完后转换；未分段时在整场结束后转换</span>
         </div>
         <el-switch
           v-model="form.auto_convert_mp4"
           active-text="开启"
           inactive-text="关闭"
         />
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header">
+          <span class="section-label">分段录制</span>
+          <span class="section-hint">全局生效，适用于所有新开始的录制</span>
+        </div>
+        <el-switch v-model="form.segment_recording_enabled" active-text="开启" inactive-text="关闭" />
+        <div v-if="form.segment_recording_enabled" class="auto-setting-row">
+          <span class="auto-setting-label">每段时长</span>
+          <div class="number-setting">
+            <el-input-number v-model="form.segment_duration_minutes" :min="1" :max="4294967295" :precision="0" :step="1" controls-position="right" />
+            <span>分钟</span>
+          </div>
+        </div>
+        <div class="quality-note">每段约为指定时长，文件名自动添加 part001 等序号，每段单独显示一条记录。修改后对新开始的录制生效。</div>
       </div>
 
       <div class="settings-section">
@@ -215,7 +231,7 @@ const saving = ref(false)
 const migrating = ref(false)
 const migrationTarget = ref('')
 const hasRunningTasks = computed(() => store.tasks.some(task =>
-  task.status === 'recording' || task.status === 'finalizing'
+  task.status === 'recording' || task.status === 'finalizing' || task.segments?.some(segment => ['queued', 'converting'].includes(segment.conversion_state))
 ))
 const version = ref('')
 
@@ -228,6 +244,8 @@ const form = reactive({
   quality: DEFAULT_QUALITY,
   recordings_dir: '',
   auto_convert_mp4: false,
+  segment_recording_enabled: false,
+  segment_duration_minutes: 60,
   time_format_24h: true,
   time_display_mode: 'absolute',
   auto_check_interval_secs: 60,
@@ -244,6 +262,8 @@ function onOpen() {
   form.recordings_dir = store.settings.recordings_dir || ''
   migrationTarget.value = ''
   form.auto_convert_mp4 = store.settings.auto_convert_mp4 ?? false
+  form.segment_recording_enabled = store.settings.segment_recording_enabled ?? false
+  form.segment_duration_minutes = store.settings.segment_duration_minutes ?? 60
   form.time_format_24h = store.settings.time_format_24h ?? true
   form.time_display_mode = store.settings.time_display_mode || 'absolute'
   form.auto_check_interval_secs = store.settings.auto_check_interval_secs ?? 60
@@ -276,6 +296,10 @@ async function onMigrate() {
 
 async function onSave() {
   if (migrating.value || saving.value) return
+  if (!Number.isInteger(form.segment_duration_minutes) || form.segment_duration_minutes < 1) {
+    ElMessage.error('分段时长必须为正整数分钟')
+    return
+  }
   saving.value = true
   try {
     await store.saveSettings({ ...form, db_path: store.settings.db_path })

@@ -34,6 +34,8 @@ pub struct RecordTask {
     pub file_path: Option<String>,
     pub file_size: Option<i64>,
     pub trigger: String,
+    pub segment_output: Option<crate::segments::SegmentOutput>,
+    pub segments: Vec<crate::segments::RecordSegment>,
 }
 
 impl rusqlite::types::FromSql for AutoMonitorMode {
@@ -49,7 +51,7 @@ impl rusqlite::types::FromSql for AutoMonitorMode {
 }
 
 pub struct Database {
-    conn: Connection,
+    pub(crate) conn: Connection,
     path: PathBuf,
 }
 
@@ -74,7 +76,7 @@ impl Database {
 
     pub fn has_running_tasks(&self) -> Result<bool> {
         self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM record_tasks WHERE status IN ('recording', 'finalizing'))",
+            "SELECT EXISTS(SELECT 1 FROM record_tasks WHERE status IN ('recording', 'finalizing')) OR EXISTS(SELECT 1 FROM record_segments WHERE conversion_state IN ('queued', 'converting'))",
             [],
             |row| row.get(0),
         )
@@ -245,6 +247,8 @@ impl Database {
             [],
         );
 
+        self.init_segments()?;
+
         Ok(())
     }
 
@@ -406,7 +410,7 @@ impl Database {
 
     pub fn has_running_tasks_for_room(&self, room_id: i64) -> Result<bool> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM record_tasks WHERE room_id = ?1 AND status IN ('recording', 'finalizing')",
+            "SELECT COUNT(*) FROM record_tasks WHERE room_id = ?1 AND (status IN ('recording', 'finalizing') OR id IN (SELECT task_id FROM record_segments WHERE conversion_state IN ('queued', 'converting')))",
             [room_id],
             |row| row.get(0),
         )?;
@@ -414,16 +418,26 @@ impl Database {
     }
 
     pub fn delete_room_cascade(&self, id: i64) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        self.conn.execute("DELETE FROM record_segments WHERE task_id IN (SELECT id FROM record_tasks WHERE room_id = ?1)", [id])?;
+        self.conn.execute("DELETE FROM segment_outputs WHERE task_id IN (SELECT id FROM record_tasks WHERE room_id = ?1)", [id])?;
         self.conn
             .execute("DELETE FROM record_tasks WHERE room_id = ?1", [id])?;
         self.conn
             .execute("DELETE FROM live_rooms WHERE id = ?1", [id])?;
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn delete_task(&self, id: i64) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        self.conn
+            .execute("DELETE FROM record_segments WHERE task_id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM segment_outputs WHERE task_id = ?1", [id])?;
         self.conn
             .execute("DELETE FROM record_tasks WHERE id = ?1", [id])?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -443,6 +457,8 @@ impl Database {
                     file_path: row.get(5)?,
                     file_size: row.get(6)?,
                     trigger: row.get(7)?,
+                    segment_output: self.get_segment_output(row.get(0)?)?,
+                    segments: self.get_segments(row.get(0)?)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -464,6 +480,8 @@ impl Database {
                     file_path: row.get(5)?,
                     file_size: row.get(6)?,
                     trigger: row.get(7)?,
+                    segment_output: self.get_segment_output(row.get(0)?)?,
+                    segments: self.get_segments(row.get(0)?)?,
                 })
             },
         )
@@ -521,6 +539,7 @@ impl Database {
     }
 
     pub fn reconcile_incomplete_tasks(&self) -> Result<()> {
+        self.recover_segments()?;
         let stale_tasks = {
             let mut stmt = self.conn.prepare(
                 "SELECT id, file_path FROM record_tasks WHERE status IN ('recording', 'finalizing')",
@@ -534,6 +553,16 @@ impl Database {
         };
 
         for (id, file_path) in stale_tasks {
+            if self.get_segment_output(id)?.is_some() {
+                let size = self.segment_total_size(id)?;
+                self.finish_task(
+                    id,
+                    if size > 0 { "interrupted" } else { "failed" },
+                    None,
+                    size,
+                )?;
+                continue;
+            }
             let file_size = file_path
                 .as_deref()
                 .and_then(|path| std::fs::metadata(path).ok())

@@ -1,11 +1,17 @@
 mod auto_policy;
 mod auto_recorder;
+mod conversion;
 mod database;
 mod desktop;
 mod lifecycle;
 mod migration;
 mod parser;
 mod recorder;
+mod segment_runtime;
+mod segment_store;
+#[cfg(all(test, windows))]
+mod segment_tests;
+mod segments;
 mod settings;
 mod updater;
 
@@ -24,9 +30,6 @@ use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex as AsyncMutex;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 fn resolve_ffmpeg_path() -> String {
     let ext = if cfg!(windows) { ".exe" } else { "" };
@@ -231,37 +234,6 @@ async fn refresh_room_internal(state: &AppState, room_id: i64) -> Result<LiveRoo
     apply_live_info(state, room_id, &info)
 }
 
-fn remux_flv_to_mp4(file_path: &str) -> Result<(String, i64), String> {
-    if !file_path.ends_with(".flv") {
-        return Err("文件不是 FLV 格式，无需转换".to_string());
-    }
-    let mp4_path = file_path.trim_end_matches(".flv").to_string() + ".mp4";
-    let mut cmd = std::process::Command::new(resolve_ffmpeg_path());
-    cmd.args(["-y", "-i", file_path, "-c", "copy", &mp4_path]);
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
-    let output = cmd.output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "ffmpeg 未找到".to_string()
-        } else {
-            format!("转换失败: {}", e)
-        }
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "ffmpeg 转换失败: {}",
-            stderr.chars().take(200).collect::<String>()
-        ));
-    }
-    if !std::path::Path::new(&mp4_path).exists() {
-        return Err("转换完成但未找到输出文件".to_string());
-    }
-    let size = file_size(Some(&mp4_path));
-    std::fs::remove_file(file_path).map_err(|e| format!("MP4 已生成，但删除 FLV 失败: {}", e))?;
-    Ok((mp4_path, size))
-}
-
 // Called with the database lock held, before publishing a finished task.
 fn apply_post_recording_auto_policy(
     state: &AppState,
@@ -355,16 +327,21 @@ async fn handle_recording_exit(
     let (original_path, original_size, task_trigger, finalizing_task) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let task = db.get_task(task_id).map_err(|e| e.to_string())?;
-        if task.status != "recording" {
+        if task.status != "recording" && task.status != "finalizing" {
             return Ok(());
         }
         state.auto_recorder.mark_recording_ended(room_id);
-        let size = file_size(task.file_path.as_deref());
+        let size = if task.segment_output.is_some() {
+            db.segment_total_size(task_id).map_err(|e| e.to_string())?
+        } else {
+            file_size(task.file_path.as_deref())
+        };
         db.mark_task_finalizing(task_id, size)
             .map_err(|e| e.to_string())?;
         let updated = db.get_task(task_id).map_err(|e| e.to_string())?;
         (task.file_path, size, task.trigger, updated)
     };
+    let segmented = finalizing_task.segment_output.is_some();
     emit_recording_event(&app, finalizing_task, None, "finalizing", None);
     #[cfg(debug_assertions)]
     {
@@ -425,7 +402,7 @@ async fn handle_recording_exit(
         }
     };
     let status = classify_recording(original_size, &exit, verification);
-    let mut final_path = original_path;
+    let mut final_path = original_path.clone();
     let mut final_size = original_size;
     let mut message = match status {
         "completed" if exit.manually_stopped => Some("录制已停止".to_string()),
@@ -439,28 +416,29 @@ async fn handle_recording_exit(
         }
         _ => verification_message,
     };
-    if status == "completed"
+    if segmented {
+        segment_runtime::finish_segments(&app, task_id, status).await?;
+        final_size = state
+            .db
+            .lock()
+            .map_err(|e| e.to_string())?
+            .segment_total_size(task_id)
+            .map_err(|e| e.to_string())?;
+    } else if status == "completed"
         && settings::load_settings().auto_convert_mp4
         && final_path
             .as_deref()
             .is_some_and(|path| path.ends_with(".flv"))
     {
         let path = final_path.clone().unwrap_or_default();
-        match tokio::task::spawn_blocking(move || remux_flv_to_mp4(&path)).await {
-            Ok(Ok((mp4_path, mp4_size))) => {
+        match conversion::remux(path).await {
+            Ok((mp4_path, mp4_size)) => {
                 final_path = Some(mp4_path);
                 final_size = mp4_size;
             }
-            Ok(Err(error)) => {
-                message = Some(format!(
-                    "{}；自动转换 MP4 失败，已保留 FLV: {}",
-                    message.unwrap_or_else(|| "录制已完成".to_string()),
-                    error
-                ));
-            }
             Err(error) => {
                 message = Some(format!(
-                    "{}；自动转换任务异常，已保留 FLV: {}",
+                    "{}；自动转换 MP4 失败，已保留 FLV: {}",
                     message.unwrap_or_else(|| "录制已完成".to_string()),
                     error
                 ));
@@ -490,6 +468,13 @@ async fn handle_recording_exit(
     let (final_task, room) = db
         .finish_task_and_automation(task_id, status, final_path.as_deref(), final_size, &room)
         .map_err(|e| e.to_string())?;
+    if final_path != original_path {
+        if let Some(source) = original_path {
+            if let Err(error) = std::fs::remove_file(source) {
+                message = Some(format!("MP4 已保存，原 FLV 删除失败: {error}"));
+            }
+        }
+    }
     emit_auto_recording_event(&app, room.clone(), auto_reason, auto_message);
     let reason = match status {
         "completed" if exit.manually_stopped => "manual_stop",
@@ -556,36 +541,143 @@ async fn start_record_from_info(
     let task_id = db.add_task(room_id, trigger).map_err(fatal)?;
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     // Task id also prevents a quick retry from overwriting an earlier partial file.
-    let filename = format!(
-        "{}_{}_{}_{}.flv",
-        room.anchor_name, room.room_id, timestamp, task_id
-    );
-    let output_str = std::path::Path::new(&recordings_dir)
-        .join(filename)
-        .to_string_lossy()
-        .to_string();
-    db.update_task_status_and_path(task_id, "recording", Some(&output_str))
-        .map_err(fatal)?;
     let app_settings = settings::load_settings();
-    let exit_app = app.clone();
-    let start_result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&output_str)
-        .map_err(|error| format!("无法创建录制文件: {}", error))
-        .and_then(|file| {
-            drop(file);
-            state.recorder.start_record(
-                task_id,
-                &info.stream_url,
-                &output_str,
-                &app_settings.proxy,
-                move |exit| handle_recording_exit(exit_app, task_id, room_id, exit),
-            )
+    let basename = format!(
+        "{}_{}_{}_{}",
+        segments::safe_filename(&room.anchor_name),
+        segments::safe_filename(&room.room_id),
+        timestamp,
+        task_id
+    );
+    let segment_output = app_settings.segment_recording_enabled.then(|| {
+        segments::SegmentOutput::new(
+            std::path::Path::new(&recordings_dir),
+            &basename,
+            u64::from(app_settings.segment_duration_minutes.max(1)) * 60,
+        )
+    });
+    let output_str = segment_output
+        .as_ref()
+        .map(|output| output.path(1))
+        .unwrap_or_else(|| {
+            std::path::Path::new(&recordings_dir)
+                .join(format!("{basename}.flv"))
+                .to_string_lossy()
+                .into_owned()
         });
+    db.update_task_status_and_path(
+        task_id,
+        "recording",
+        if segment_output.is_none() {
+            Some(&output_str)
+        } else {
+            None
+        },
+    )
+    .map_err(fatal)?;
+    if let Some(output) = &segment_output {
+        db.set_segment_output(task_id, output).map_err(fatal)?;
+    }
+    let exit_app = app.clone();
+    let start_result = (|| -> Result<(), String> {
+        if let Some(output) = &segment_output {
+            let manifest = std::path::Path::new(&output.manifest_path);
+            std::fs::create_dir_all(manifest.parent().ok_or("分段清单目录无效")?)
+                .map_err(|e| e.to_string())?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(manifest)
+                .map_err(|e| format!("无法创建分段清单: {e}"))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_str)
+            .map_err(|error| format!("无法创建录制文件: {}", error))?;
+        drop(file);
+        if segment_output.is_some() {
+            let task = db.get_task(task_id).map_err(|e| e.to_string())?;
+            db.add_segment(task_id, 1, &output_str, &task.start_time)
+                .map_err(|e| e.to_string())?;
+        }
+        let (monitor_stop, monitor_rx) = tokio::sync::watch::channel(false);
+        let monitor = segment_output.clone().map(|output| {
+            tokio::spawn(segment_runtime::monitor(
+                app.clone(),
+                task_id,
+                output,
+                monitor_rx,
+            ))
+        });
+        let abort = monitor.as_ref().map(|handle| handle.abort_handle());
+        let stop_on_failure = monitor_stop.clone();
+        let result = state.recorder.start_record_with_segments(
+            task_id,
+            &info.stream_url,
+            &output_str,
+            &app_settings.proxy,
+            segment_output.as_ref(),
+            move |exit| async move {
+                let mut monitor_error = None;
+                if let Some(monitor) = monitor {
+                    let _ = monitor_stop.send(true);
+                    {
+                        let state = exit_app.state::<AppState>();
+                        let db = state.db.lock().map_err(|e| e.to_string())?;
+                        db.mark_task_finalizing(
+                            task_id,
+                            db.segment_total_size(task_id).map_err(|e| e.to_string())?,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        emit_recording_event(
+                            &exit_app,
+                            db.get_task(task_id).map_err(|e| e.to_string())?,
+                            None,
+                            "finalizing",
+                            None,
+                        );
+                    }
+                    if let Err(error) = monitor
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|result| result)
+                    {
+                        monitor_error = Some(error);
+                    }
+                }
+                handle_recording_exit(exit_app, task_id, room_id, exit).await?;
+                monitor_error.map_or(Ok(()), Err)
+            },
+        );
+        if result.is_err() {
+            let _ = stop_on_failure.send(true);
+            if let Some(abort) = abort {
+                abort.abort();
+            }
+        }
+        result
+    })();
     if let Err(error) = start_result {
-        db.finish_task(task_id, "failed", Some(&output_str), 0)
+        for segment in db.get_segments(task_id).map_err(fatal)? {
+            db.close_segment(
+                segment.id,
+                "failed",
+                &Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            )
             .map_err(fatal)?;
+        }
+        db.finish_task(
+            task_id,
+            "failed",
+            if segment_output.is_none() {
+                Some(&output_str)
+            } else {
+                None
+            },
+            0,
+        )
+        .map_err(fatal)?;
         emit_recording_event(
             app,
             db.get_task(task_id).map_err(fatal)?,
@@ -1070,6 +1162,13 @@ fn delete_task(state: State<AppState>, id: i64) -> Result<(), String> {
     if task.status == "recording" || task.status == "finalizing" {
         return Err("该任务正在录制或结束处理中，请先停止录制".to_string());
     }
+    if task
+        .segments
+        .iter()
+        .any(|segment| matches!(segment.conversion_state.as_str(), "queued" | "converting"))
+    {
+        return Err("分段正在转换，请等待完成后再删除记录".into());
+    }
     db.delete_task(id).map_err(|e| e.to_string())
 }
 
@@ -1125,36 +1224,106 @@ async fn stop_record(
 
 #[tauri::command]
 async fn convert_to_mp4(app: AppHandle, task_id: i64) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let _operation = state.lifecycle.operation()?;
-        let result = convert_task_to_mp4(&state, task_id);
-        if let Err(error) = &result {
-            state.lifecycle.record_failure(error.clone());
-        }
-        result
-    })
-    .await
-    .map_err(|e| format!("转换任务异常: {e}"))?
-}
-
-fn convert_task_to_mp4(state: &AppState, task_id: i64) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let _operation = state.lifecycle.operation()?;
     let task = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.get_task(task_id).map_err(|e| e.to_string())?
+        let task = db.get_task(task_id).map_err(|e| e.to_string())?;
+        if task.status == "recording" || task.status == "finalizing" {
+            return Err("录制或转换尚未结束，请稍后再试".into());
+        }
+        if task.segment_output.is_some() {
+            return Err("请选择具体分段进行转换".into());
+        }
+        if task
+            .file_path
+            .as_deref()
+            .is_none_or(|path| !path.ends_with(".flv"))
+        {
+            return Err("找不到可转换的 FLV 文件".into());
+        }
+        db.update_task_status(task_id, "finalizing")
+            .map_err(|e| e.to_string())?;
+        emit_recording_event(
+            &app,
+            db.get_task(task_id).map_err(|e| e.to_string())?,
+            None,
+            "conversion_started",
+            None,
+        );
+        task
     };
-    if task.status == "recording" || task.status == "finalizing" {
-        return Err("录制尚未结束，暂时不能转换".to_string());
-    }
-    let file_path = task
-        .file_path
-        .as_deref()
-        .ok_or_else(|| "文件路径为空".to_string())?;
-    let (mp4_path, size) = remux_flv_to_mp4(file_path)?;
+    let source = task.file_path.clone().unwrap();
+    let result = conversion::remux(source.clone()).await;
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.finish_task(task_id, &task.status, Some(&mp4_path), size)
-        .map_err(|e| e.to_string())?;
-    Ok(mp4_path)
+    match &result {
+        Ok((path, size)) => {
+            db.finish_task(task_id, &task.status, Some(path), *size)
+                .map_err(|e| e.to_string())?;
+            if let Err(error) = std::fs::remove_file(&source) {
+                emit_recording_event(
+                    &app,
+                    db.get_task(task_id).map_err(|e| e.to_string())?,
+                    None,
+                    "conversion_finished",
+                    Some(format!("MP4 已保存，原 FLV 删除失败: {error}")),
+                );
+            }
+        }
+        Err(error) => {
+            db.update_task_status(task_id, &task.status)
+                .map_err(|e| e.to_string())?;
+            state.lifecycle.record_failure(error.clone());
+        }
+    }
+    emit_recording_event(
+        &app,
+        db.get_task(task_id).map_err(|e| e.to_string())?,
+        None,
+        "conversion_finished",
+        None,
+    );
+    result.map(|(path, _)| path)
+}
+
+#[tauri::command]
+async fn convert_segment_to_mp4(app: AppHandle, segment_id: i64) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let _operation = state.lifecycle.operation()?;
+    let task_id = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        if !db
+            .claim_segment_conversion(segment_id)
+            .map_err(|e| e.to_string())?
+        {
+            return Err("该分段正在录制、转换中，或没有可转换的 FLV 文件".into());
+        }
+        db.get_segment(segment_id)
+            .map_err(|e| e.to_string())?
+            .task_id
+    };
+    segment_runtime::emit_segments(&app, task_id)?;
+    let result = conversion::convert_claimed_segment(app.clone(), segment_id).await;
+    if let Err(error) = &result {
+        state.lifecycle.record_failure(error.clone());
+    }
+    result
+}
+
+#[tauri::command]
+fn delete_segment(app: AppHandle, segment_id: i64) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _operation = state.lifecycle.operation()?;
+    let task_id = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        if !db.hide_segment(segment_id).map_err(|e| e.to_string())? {
+            return Err("正在录制或转换，暂时不能删除记录".into());
+        }
+        db.get_segment(segment_id)
+            .map_err(|e| e.to_string())?
+            .task_id
+    };
+    segment_runtime::emit_segments(&app, task_id)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1209,6 +1378,8 @@ pub fn run() {
             start_record,
             stop_record,
             convert_to_mp4,
+            convert_segment_to_mp4,
+            delete_segment,
             get_settings_cmd,
             save_settings_cmd,
             migrate_db_cmd,

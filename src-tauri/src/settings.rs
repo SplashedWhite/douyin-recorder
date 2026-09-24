@@ -37,6 +37,8 @@ pub struct AppSettings {
     pub recordings_dir: String,
     pub db_path: String,
     pub auto_convert_mp4: bool,
+    pub segment_recording_enabled: bool,
+    pub segment_duration_minutes: u32,
     pub time_format_24h: bool,
     pub time_display_mode: String,
     pub auto_check_interval_secs: u64,
@@ -67,6 +69,8 @@ impl Default for AppSettings {
             recordings_dir: default_recordings,
             db_path: String::new(),
             auto_convert_mp4: false,
+            segment_recording_enabled: false,
+            segment_duration_minutes: 60,
             time_format_24h: true,
             time_display_mode: "absolute".to_string(),
             auto_check_interval_secs: 60,
@@ -115,6 +119,9 @@ pub fn load_settings_from(path: &Path) -> Result<AppSettings, String> {
 }
 
 pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), String> {
+    if settings.segment_duration_minutes == 0 {
+        return Err("分段时长必须为正整数分钟".to_string());
+    }
     if !(10..=3600).contains(&settings.auto_check_interval_secs) {
         return Err("自动录制检测间隔必须在 10 到 3600 秒之间".to_string());
     }
@@ -146,6 +153,27 @@ pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{load_settings_from, save_settings_at, AppSettings};
+
+    #[test]
+    fn segment_settings_upgrade_roundtrip_and_reject_zero_without_overwriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, r#"{"quality":"HD1","auto_convert_mp4":true}"#).unwrap();
+        let mut settings = load_settings_from(&path).unwrap();
+        assert!(!settings.segment_recording_enabled);
+        assert_eq!(settings.segment_duration_minutes, 60);
+        settings.segment_recording_enabled = true;
+        settings.segment_duration_minutes = 30;
+        save_settings_at(&settings, &path).unwrap();
+        let loaded = load_settings_from(&path).unwrap();
+        assert!(loaded.segment_recording_enabled && loaded.auto_convert_mp4);
+        assert_eq!(loaded.segment_duration_minutes, 30);
+        assert_eq!(loaded.quality, "HD1");
+        let original = std::fs::read(&path).unwrap();
+        settings.segment_duration_minutes = 0;
+        assert!(save_settings_at(&settings, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
 
     #[test]
     fn close_behavior_defaults_and_round_trips_without_losing_settings() {

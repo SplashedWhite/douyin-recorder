@@ -35,6 +35,8 @@ export const useRecorderStore = defineStore('recorder', () => {
     recordings_dir: '',
     db_path: '',
     auto_convert_mp4: false,
+    segment_recording_enabled: false,
+    segment_duration_minutes: 60,
     time_format_24h: true,
     time_display_mode: 'absolute',
     auto_check_interval_secs: 60,
@@ -43,6 +45,7 @@ export const useRecorderStore = defineStore('recorder', () => {
     notify_updates: true,
   })
   let unlistenRecordingStatus: UnlistenFn | null = null
+  let unlistenSegments: UnlistenFn | null = null
   let unlistenAutoRecordingStatus: UnlistenFn | null = null
   let refreshAllPromise: Promise<RoomRefreshResult> | null = null
 
@@ -66,6 +69,9 @@ export const useRecorderStore = defineStore('recorder', () => {
   }
 
   async function listenRecordingEvents() {
+    if (!unlistenSegments) {
+      unlistenSegments = await listen<RecordTask>('recording-segments-changed', ({ payload }) => upsertTask(payload))
+    }
     if (!unlistenRecordingStatus) {
       unlistenRecordingStatus = await listen<RecordingStatusChanged>('recording-status-changed', ({ payload }) => {
         upsertTask(payload.task)
@@ -100,6 +106,8 @@ export const useRecorderStore = defineStore('recorder', () => {
   }
 
   function stopListeningRecordingEvents() {
+    unlistenSegments?.()
+    unlistenSegments = null
     unlistenRecordingStatus?.()
     unlistenRecordingStatus = null
     unlistenAutoRecordingStatus?.()
@@ -272,6 +280,14 @@ export const useRecorderStore = defineStore('recorder', () => {
     }
   }
 
+  async function convertSegmentToMp4(segmentId: number): Promise<string> {
+    return invoke<string>('convert_segment_to_mp4', { segmentId })
+  }
+
+  async function deleteSegment(segmentId: number) {
+    await invoke('delete_segment', { segmentId })
+  }
+
   async function saveSettings(newSettings: AppSettings) {
     try {
       const updateNotificationsWereEnabled = settings.value.notify_updates
@@ -319,7 +335,7 @@ export const useRecorderStore = defineStore('recorder', () => {
     listenRecordingEvents, stopListeningRecordingEvents,
     loadRooms, addRoom, refreshRoom, refreshAllRooms, setRoomAutoRecord, setRoomAutoSchedule, setRoomAutoConfig,
     deleteRoom, getRoomTaskCount,
-    loadTasks, startRecord, stopRecord, deleteTask, convertToMp4,
+    loadTasks, startRecord, stopRecord, deleteTask, convertToMp4, convertSegmentToMp4, deleteSegment,
     loadSettings, saveSettings, checkForUpdate, migrateDb
   }
 })

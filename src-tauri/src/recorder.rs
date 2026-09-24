@@ -129,12 +129,30 @@ impl Recorder {
         }
     }
 
+    #[cfg(test)]
     pub fn start_record<F, Fut>(
         &self,
         task_id: i64,
         stream_url: &str,
         output_path: &str,
         proxy: &str,
+        on_exit: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(RecordingExit) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.start_record_with_segments(task_id, stream_url, output_path, proxy, None, on_exit)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_record_with_segments<F, Fut>(
+        &self,
+        task_id: i64,
+        stream_url: &str,
+        output_path: &str,
+        proxy: &str,
+        segments: Option<&crate::segments::SegmentOutput>,
         on_exit: F,
     ) -> Result<(), String>
     where
@@ -166,14 +184,28 @@ impl Recorder {
             stream_url,
             "-c",
             "copy",
-            "-f",
-            "flv",
-            output_path,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        ]);
+        if let Some(segments) = segments {
+            cmd.args(["-f", "segment", "-segment_format", "flv", "-segment_time"])
+                .arg(segments.duration_secs.to_string())
+                .args([
+                    "-segment_start_number",
+                    "1",
+                    "-reset_timestamps",
+                    "1",
+                    "-segment_list_type",
+                    "csv",
+                    "-segment_list",
+                ])
+                .arg(&segments.manifest_path)
+                .arg(&segments.output_pattern);
+        } else {
+            cmd.args(["-f", "flv", output_path]);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         #[cfg(windows)]
         cmd.as_std_mut().creation_flags(0x08000000); // CREATE_NO_WINDOW

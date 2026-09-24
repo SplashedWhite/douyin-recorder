@@ -29,6 +29,22 @@ export interface RecordTask {
   file_path: string | null
   file_size: number | null
   trigger: 'manual' | 'auto'
+  segment_output: { file_prefix: string; output_pattern: string; manifest_path: string; duration_secs: number } | null
+  segments: RecordSegment[]
+}
+
+export interface RecordSegment {
+  id: number
+  task_id: number
+  segment_index: number
+  file_path: string
+  file_size: number
+  start_time: string
+  end_time: string | null
+  status: RecordTask['status']
+  conversion_state: 'idle' | 'queued' | 'converting' | 'failed'
+  conversion_error: string | null
+  deleted: boolean
 }
 
 export interface AppSettings {
@@ -39,6 +55,8 @@ export interface AppSettings {
   recordings_dir: string
   db_path: string
   auto_convert_mp4: boolean
+  segment_recording_enabled: boolean
+  segment_duration_minutes: number
   time_format_24h: boolean
   time_display_mode: string
   auto_check_interval_secs: number
@@ -62,7 +80,7 @@ export interface UpdateInfo {
 export interface RecordingStatusChanged {
   task: RecordTask
   room: LiveRoom | null
-  reason: 'finalizing' | 'manual_stop' | 'stream_ended' | 'interrupted' | 'failed' | 'auto_started'
+  reason: 'finalizing' | 'manual_stop' | 'stream_ended' | 'interrupted' | 'failed' | 'auto_started' | 'conversion_started' | 'conversion_finished'
   message: string | null
 }
 

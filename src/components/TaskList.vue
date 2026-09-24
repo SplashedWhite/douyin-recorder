@@ -27,7 +27,7 @@
       <TransitionGroup name="task">
         <div
           v-for="task in tasks"
-          :key="task.id"
+          :key="task.rowKey"
           class="task-card"
           :class="task.status"
         >
@@ -38,14 +38,16 @@
             <div class="task-header-row">
               <span class="task-status-badge" :class="task.status">
                 <span class="badge-dot"></span>
-                {{ getStatusText(task.status) }}
+                {{ getStatusText(task.status, task.conversionState) }}
               </span>
               <span v-if="task.trigger === 'auto'" class="task-trigger-badge">自动</span>
+              <span v-if="task.segmentIndex" class="task-trigger-badge">第 {{ task.segmentIndex }} 段</span>
               <span class="task-time">{{ formatTime(task.start_time) }}</span>
             </div>
             <div class="task-path" v-if="task.file_path">
               {{ task.file_path.split(/[/\\]/).pop() }}
             </div>
+            <div v-if="task.conversionError" class="segment-error">{{ task.conversionError }}</div>
           </div>
 
           <div class="task-actions">
@@ -53,7 +55,7 @@
               v-if="task.status === 'recording'"
               class="icon-btn warning"
               @click="stopRecord(task)"
-              title="停止录制"
+              :title="task.segmentId ? '停止本场录制' : '停止录制'"
             >
               <el-icon :size="15"><VideoPause /></el-icon>
             </button>
@@ -85,7 +87,7 @@
               class="icon-btn danger"
               @click="deleteTask(task)"
               :disabled="task.status === 'recording' || task.status === 'finalizing'"
-              title="删除任务"
+              title="删除记录（保留文件）"
             >
               <el-icon :size="15"><Delete /></el-icon>
             </button>
@@ -98,16 +100,23 @@
 
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
+import { computed } from 'vue'
 import { useRecorderStore } from '../stores/recorder'
 import { ElMessage } from 'element-plus'
 import { Delete, VideoPause, FolderOpened, Folder, Switch } from '@element-plus/icons-vue'
 import { openPath, revealItemInDir } from '@tauri-apps/plugin-opener'
-import type { RecordTask } from '../types'
+import type { RecordSegment } from '../types'
+import { recordingRows, type TaskRow } from '../utils/recordingRows'
 
 const store = useRecorderStore()
-const { tasks, settings } = storeToRefs(store)
+const { tasks: sessions, settings } = storeToRefs(store)
 
-function getStatusText(status: string) {
+const tasks = computed(() => recordingRows(sessions.value))
+
+function getStatusText(status: string, conversionState?: RecordSegment['conversion_state']) {
+  if (conversionState === 'queued') return '等待转换'
+  if (conversionState === 'converting') return '转换中'
+  if (conversionState === 'failed') return '转换失败 · FLV 已保留'
   const map: Record<string, string> = {
     waiting: '等待中',
     recording: '录制中',
@@ -196,7 +205,7 @@ function formatTime(time: string) {
   }
 }
 
-async function stopRecord(task: RecordTask) {
+async function stopRecord(task: TaskRow) {
   try {
     const updated = await store.stopRecord(task.id)
     if (updated.status === 'completed') ElMessage.success('录制已停止')
@@ -205,7 +214,7 @@ async function stopRecord(task: RecordTask) {
   }
 }
 
-async function openFile(task: RecordTask) {
+async function openFile(task: TaskRow) {
   if (!task.file_path) {
     ElMessage.warning('文件路径为空')
     return
@@ -217,7 +226,7 @@ async function openFile(task: RecordTask) {
   }
 }
 
-async function openFolder(task: RecordTask) {
+async function openFolder(task: TaskRow) {
   if (!task.file_path) {
     ElMessage.warning('文件路径为空')
     return
@@ -229,30 +238,32 @@ async function openFolder(task: RecordTask) {
   }
 }
 
-function isFlvFile(task: RecordTask): boolean {
+function isFlvFile(task: TaskRow): boolean {
   return !!task.file_path && task.file_path.endsWith('.flv')
 }
 
-function canAccessFile(task: RecordTask): boolean {
+function canAccessFile(task: TaskRow): boolean {
   return !!task.file_path && ['completed', 'interrupted', 'failed'].includes(task.status)
 }
 
-function canConvert(task: RecordTask): boolean {
+function canConvert(task: TaskRow): boolean {
   return canAccessFile(task) && isFlvFile(task)
 }
 
-async function convertToMp4(task: RecordTask) {
+async function convertToMp4(task: TaskRow) {
   try {
-    await store.convertToMp4(task.id)
+    if (task.segmentId) await store.convertSegmentToMp4(task.segmentId)
+    else await store.convertToMp4(task.id)
     ElMessage.success('已转换为 MP4')
   } catch (e) {
     ElMessage.error(`转换失败: ${e}`)
   }
 }
 
-async function deleteTask(task: RecordTask) {
+async function deleteTask(task: TaskRow) {
   try {
-    await store.deleteTask(task.id)
+    if (task.segmentId) await store.deleteSegment(task.segmentId)
+    else await store.deleteTask(task.id)
     ElMessage.success('删除成功')
   } catch (e) {
     ElMessage.error(`删除失败: ${e}`)
@@ -261,6 +272,12 @@ async function deleteTask(task: RecordTask) {
 </script>
 
 <style scoped>
+.segment-error {
+  margin-top: 4px;
+  color: var(--color-warning);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
 .card-header {
   display: flex;
   justify-content: space-between;
