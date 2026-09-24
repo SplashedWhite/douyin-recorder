@@ -6,6 +6,7 @@ import { ElMessage } from 'element-plus'
 import { DEFAULT_QUALITY } from '../constants/quality'
 import type {
   LiveRoom,
+  AutoMonitorMode,
   RecordTask,
   AppSettings,
   UpdateInfo,
@@ -57,7 +58,8 @@ export const useRecorderStore = defineStore('recorder', () => {
     const index = rooms.value.findIndex(item => item.id === room.id)
     if (index === -1) {
       rooms.value.push(room)
-    } else {
+    } else if (room.auto_record_revision >= rooms.value[index].auto_record_revision) {
+      // A command response may arrive after a newer background event.
       rooms.value[index] = room
     }
   }
@@ -85,7 +87,7 @@ export const useRecorderStore = defineStore('recorder', () => {
         upsertRoom(payload.room)
         if (!payload.message) return
 
-        if (['enabled', 'scheduled', 'schedule_triggered'].includes(payload.reason)) {
+        if (['enabled', 'scheduled', 'schedule_triggered', 'configured'].includes(payload.reason)) {
           ElMessage.success(payload.message)
         } else if (payload.reason === 'paused' || payload.reason === 'window_expired' || payload.reason === 'backoff') {
           ElMessage.warning(payload.message)
@@ -106,7 +108,9 @@ export const useRecorderStore = defineStore('recorder', () => {
   async function loadRooms() {
     try {
       const result = await invoke<LiveRoom[]>('get_rooms')
-      rooms.value = result || []
+      const ids = new Set((result || []).map(room => room.id))
+      rooms.value = rooms.value.filter(room => ids.has(room.id))
+      for (const room of result || []) upsertRoom(room)
     } catch (e) {
       console.error('加载房间失败:', e)
     }
@@ -174,6 +178,12 @@ export const useRecorderStore = defineStore('recorder', () => {
 
   async function setRoomAutoSchedule(roomId: number, dailyTime: string | null): Promise<LiveRoom> {
     const room = await invoke<LiveRoom>('set_room_auto_schedule', { roomId, dailyTime })
+    upsertRoom(room)
+    return room
+  }
+
+  async function setRoomAutoConfig(roomId: number, monitorMode: AutoMonitorMode, dailyTime: string | null): Promise<LiveRoom> {
+    const room = await invoke<LiveRoom>('set_room_auto_config', { roomId, monitorMode, dailyTime })
     upsertRoom(room)
     return room
   }
@@ -306,7 +316,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   return {
     rooms, tasks, loading, isRefreshingAll, settings, availableUpdate,
     listenRecordingEvents, stopListeningRecordingEvents,
-    loadRooms, addRoom, refreshRoom, refreshAllRooms, setRoomAutoRecord, setRoomAutoSchedule,
+    loadRooms, addRoom, refreshRoom, refreshAllRooms, setRoomAutoRecord, setRoomAutoSchedule, setRoomAutoConfig,
     deleteRoom, getRoomTaskCount,
     loadTasks, startRecord, stopRecord, deleteTask, convertToMp4,
     loadSettings, saveSettings, checkForUpdate, migrateDb

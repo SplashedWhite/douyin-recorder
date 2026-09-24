@@ -1,8 +1,9 @@
+use crate::auto_policy::AutoMonitorMode;
 use rusqlite::{Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct LiveRoom {
     pub id: i64,
     pub platform: String,
@@ -14,6 +15,10 @@ pub struct LiveRoom {
     pub is_live: bool,
     pub created_at: String,
     pub auto_record_enabled: bool,
+    pub auto_monitor_mode: AutoMonitorMode,
+    pub auto_record_retry_at: Option<String>,
+    pub auto_record_error: Option<String>,
+    pub auto_record_revision: i64,
     pub auto_record_daily_time: Option<String>,
     pub auto_record_until: Option<String>,
     pub last_schedule_trigger_date: Option<String>,
@@ -29,6 +34,18 @@ pub struct RecordTask {
     pub file_path: Option<String>,
     pub file_size: Option<i64>,
     pub trigger: String,
+}
+
+impl rusqlite::types::FromSql for AutoMonitorMode {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value.as_str()? {
+            "window" => Ok(Self::Window),
+            "continuous" => Ok(Self::Continuous),
+            _ => Err(rusqlite::types::FromSqlError::Other(
+                "无效的监控模式".into(),
+            )),
+        }
+    }
 }
 
 pub struct Database {
@@ -186,6 +203,29 @@ impl Database {
             [],
         );
 
+        // Inspect columns instead of swallowing migration errors. This also upgrades
+        // databases created before automation existed, after the legacy migrations above.
+        let columns = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(live_rooms)")?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>>>()?;
+            names
+        };
+        for (name, definition) in [
+            ("auto_monitor_mode", "TEXT NOT NULL DEFAULT 'window'"),
+            ("auto_record_retry_at", "TEXT"),
+            ("auto_record_error", "TEXT"),
+            ("auto_record_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !columns.iter().any(|column| column == name) {
+                self.conn.execute(
+                    &format!("ALTER TABLE live_rooms ADD COLUMN {name} {definition}"),
+                    [],
+                )?;
+            }
+        }
+
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS record_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,7 +250,7 @@ impl Database {
 
     pub fn get_all_rooms(&self) -> Result<Vec<LiveRoom>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live, created_at, auto_record_enabled, auto_record_daily_time, auto_record_until, last_schedule_trigger_date FROM live_rooms"
+            "SELECT id, platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live, created_at, auto_record_enabled, auto_record_daily_time, auto_record_until, last_schedule_trigger_date, auto_monitor_mode, auto_record_retry_at, auto_record_error, auto_record_revision FROM live_rooms"
         )?;
 
         let rooms = stmt
@@ -229,6 +269,10 @@ impl Database {
                     auto_record_daily_time: row.get(10)?,
                     auto_record_until: row.get(11)?,
                     last_schedule_trigger_date: row.get(12)?,
+                    auto_monitor_mode: row.get(13)?,
+                    auto_record_retry_at: row.get(14)?,
+                    auto_record_error: row.get(15)?,
+                    auto_record_revision: row.get(16)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -238,7 +282,7 @@ impl Database {
 
     pub fn get_room(&self, id: i64) -> Result<LiveRoom> {
         self.conn.query_row(
-            "SELECT id, platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live, created_at, auto_record_enabled, auto_record_daily_time, auto_record_until, last_schedule_trigger_date FROM live_rooms WHERE id = ?1",
+            "SELECT id, platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live, created_at, auto_record_enabled, auto_record_daily_time, auto_record_until, last_schedule_trigger_date, auto_monitor_mode, auto_record_retry_at, auto_record_error, auto_record_revision FROM live_rooms WHERE id = ?1",
             [id],
             |row| {
                 Ok(LiveRoom {
@@ -255,6 +299,10 @@ impl Database {
                     auto_record_daily_time: row.get(10)?,
                     auto_record_until: row.get(11)?,
                     last_schedule_trigger_date: row.get(12)?,
+                    auto_monitor_mode: row.get(13)?,
+                    auto_record_retry_at: row.get(14)?,
+                    auto_record_error: row.get(15)?,
+                    auto_record_revision: row.get(16)?,
                 })
             },
         )
@@ -294,33 +342,51 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn set_room_auto_record(&self, id: i64, enabled: bool, until: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "UPDATE live_rooms SET auto_record_enabled = ?1, auto_record_until = ?2 WHERE id = ?3",
+            "UPDATE live_rooms SET auto_record_enabled = ?1, auto_record_until = ?2, auto_record_error = NULL, auto_record_retry_at = NULL, auto_record_revision = auto_record_revision + 1 WHERE id = ?3",
             rusqlite::params![enabled, until, id],
         )?;
         Ok(())
     }
 
-    pub fn set_room_auto_schedule(
-        &self,
-        id: i64,
-        daily_time: Option<&str>,
-        last_trigger_date: Option<&str>,
-    ) -> Result<()> {
+    /// Callers serialize read/decide/write with AppState.db. A revision lets
+    /// in-flight network checks discard results after a newer user decision.
+    pub fn save_room_automation(&self, room: &LiveRoom) -> Result<LiveRoom> {
         self.conn.execute(
-            "UPDATE live_rooms SET auto_record_daily_time = ?1, last_schedule_trigger_date = ?2 WHERE id = ?3",
-            rusqlite::params![daily_time, last_trigger_date, id],
+            "UPDATE live_rooms SET auto_record_enabled = ?1, auto_monitor_mode = ?2,
+             auto_record_until = ?3, auto_record_daily_time = ?4, last_schedule_trigger_date = ?5,
+             auto_record_retry_at = ?6, auto_record_error = ?7,
+             auto_record_revision = auto_record_revision + 1 WHERE id = ?8",
+            rusqlite::params![
+                room.auto_record_enabled,
+                room.auto_monitor_mode.as_str(),
+                room.auto_record_until,
+                room.auto_record_daily_time,
+                room.last_schedule_trigger_date,
+                room.auto_record_retry_at,
+                room.auto_record_error,
+                room.id
+            ],
         )?;
-        Ok(())
+        self.get_room(room.id)
     }
 
-    pub fn trigger_room_auto_schedule(&self, id: i64, until: &str, date: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE live_rooms SET auto_record_enabled = 1, auto_record_until = ?1, last_schedule_trigger_date = ?2 WHERE id = ?3",
-            rusqlite::params![until, date, id],
-        )?;
-        Ok(())
+    pub fn finish_task_and_automation(
+        &self,
+        task_id: i64,
+        status: &str,
+        path: Option<&str>,
+        size: i64,
+        room: &LiveRoom,
+    ) -> Result<(RecordTask, LiveRoom)> {
+        let transaction = self.conn.unchecked_transaction()?;
+        self.finish_task(task_id, status, path, size)?;
+        let room = self.save_room_automation(room)?;
+        let task = self.get_task(task_id)?;
+        transaction.commit()?;
+        Ok((task, room))
     }
 
     pub fn delete_room(&self, id: i64) -> Result<()> {
@@ -664,11 +730,142 @@ mod tests {
         assert_eq!(room.auto_record_daily_time, None);
         assert_eq!(room.auto_record_until, None);
         assert_eq!(room.last_schedule_trigger_date, None);
+        assert_eq!(
+            room.auto_monitor_mode,
+            crate::auto_policy::AutoMonitorMode::Window
+        );
+        assert_eq!(room.auto_record_retry_at, None);
+        assert_eq!(room.auto_record_error, None);
+        assert_eq!(room.auto_record_revision, 0);
         let task = db.get_task(1).expect("read migrated task");
         assert_eq!(task.trigger, "manual");
 
         drop(db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_dir(temp_dir);
+    }
+
+    #[test]
+    fn monitoring_config_round_trips_and_migration_is_idempotent() {
+        use crate::auto_policy::{self, AutoMonitorMode};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automation.db");
+        let db = Database::new(&path).unwrap();
+        let id = db
+            .add_room_full("douyin", "room", "anchor", "", "", "", false)
+            .unwrap();
+        let mut room = db.get_room(id).unwrap();
+        assert_eq!(room.auto_monitor_mode, AutoMonitorMode::Window);
+        let now = chrono::Local::now();
+        auto_policy::configure(
+            &mut room,
+            AutoMonitorMode::Continuous,
+            Some("00:00".into()),
+            6,
+            now,
+        )
+        .unwrap();
+        auto_policy::set_enabled(&mut room, true, 6, now.with_timezone(&chrono::Utc));
+        room.auto_record_retry_at = Some((now + chrono::Duration::minutes(30)).to_rfc3339());
+        room.auto_record_error = Some("限流，等待重试".into());
+        let saved = db.save_room_automation(&room).unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let db = Database::new(&path).unwrap();
+            let loaded = db.get_all_rooms().unwrap().pop().unwrap();
+            assert_eq!(loaded.auto_monitor_mode, AutoMonitorMode::Continuous);
+            assert!(loaded.auto_record_enabled);
+            assert_eq!(loaded.auto_record_daily_time.as_deref(), Some("00:00"));
+            assert_eq!(loaded.auto_record_until, None);
+            assert_eq!(loaded.auto_record_retry_at, saved.auto_record_retry_at);
+            assert_eq!(loaded.auto_record_error, saved.auto_record_error);
+            assert_eq!(loaded.auto_record_revision, saved.auto_record_revision);
+        }
+    }
+
+    #[test]
+    fn old_network_result_cannot_override_switch_or_mode_changes() {
+        use crate::auto_policy::{self, AutoMonitorMode};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("automation.db")).unwrap();
+        let id = db
+            .add_room_full("douyin", "room", "anchor", "", "", "", false)
+            .unwrap();
+        let now = chrono::Utc::now();
+        let mut room = db.get_room(id).unwrap();
+        auto_policy::set_enabled(&mut room, true, 6, now);
+        let snapshot = db.save_room_automation(&room).unwrap();
+        assert!(auto_policy::accepts_check(
+            &snapshot,
+            snapshot.auto_record_revision,
+            false,
+            now
+        ));
+        auto_policy::set_enabled(&mut room, false, 6, now);
+        db.save_room_automation(&room).unwrap();
+        auto_policy::set_enabled(&mut room, true, 6, now);
+        let current = db.save_room_automation(&room).unwrap();
+        assert!(!auto_policy::accepts_check(
+            &current,
+            snapshot.auto_record_revision,
+            false,
+            now
+        ));
+        assert!(auto_policy::accepts_check(
+            &current,
+            current.auto_record_revision,
+            false,
+            now
+        ));
+        assert!(!auto_policy::accepts_check(
+            &current,
+            current.auto_record_revision,
+            true,
+            now
+        ));
+        auto_policy::configure(
+            &mut room,
+            AutoMonitorMode::Continuous,
+            None,
+            6,
+            chrono::Local::now(),
+        )
+        .unwrap();
+        let changed = db.save_room_automation(&room).unwrap();
+        assert!(!auto_policy::accepts_check(
+            &changed,
+            current.auto_record_revision,
+            false,
+            now
+        ));
+    }
+
+    #[test]
+    fn task_completion_and_monitoring_state_commit_or_rollback_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("automation.db")).unwrap();
+        let id = db
+            .add_room_full("douyin", "room", "anchor", "", "", "", false)
+            .unwrap();
+        let task = db.add_task(id, "auto").unwrap();
+        db.update_task_status(task, "finalizing").unwrap();
+        let mut room = db.get_room(id).unwrap();
+        room.id = id + 1; // Force the room update to fail after updating the task.
+        assert!(db
+            .finish_task_and_automation(task, "interrupted", None, 123, &room)
+            .is_err());
+        assert_eq!(db.get_task(task).unwrap().status, "finalizing");
+        assert!(db.has_running_tasks_for_room(id).unwrap());
+        room.id = id;
+        room.auto_record_enabled = true;
+        room.auto_record_retry_at = Some("2099-01-01T00:00:00Z".into());
+        room.auto_record_error = Some("录制异常，等待重试".into());
+        let (saved_task, saved_room) = db
+            .finish_task_and_automation(task, "interrupted", None, 123, &room)
+            .unwrap();
+        assert_eq!(saved_task.status, "interrupted");
+        assert_eq!(saved_task.file_size, Some(123));
+        assert_eq!(saved_room.auto_record_retry_at, room.auto_record_retry_at);
+        assert!(!db.has_running_tasks_for_room(id).unwrap());
     }
 }

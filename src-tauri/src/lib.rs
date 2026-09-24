@@ -1,3 +1,4 @@
+mod auto_policy;
 mod auto_recorder;
 mod database;
 mod migration;
@@ -6,8 +7,12 @@ mod recorder;
 mod settings;
 mod updater;
 
+#[cfg(test)]
+use auto_policy::{daily_schedule_is_due, initial_schedule_marker};
+use auto_policy::{monitor_is_expired, monitor_until};
+use auto_policy::{AutoMonitorMode, PostRecordAction, TickAction};
 use auto_recorder::AutoRecorder;
-use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use database::{Database, LiveRoom, RecordTask};
 use parser::{DouyinParser, LiveInfo};
 use recorder::{Recorder, RecordingExit};
@@ -77,13 +82,6 @@ enum LiveVerification {
     Failed,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum AutoPostRecordAction {
-    Disable,
-    Continue,
-    Preserve,
-}
-
 fn classify_recording(
     file_size: i64,
     exit: &RecordingExit,
@@ -105,47 +103,21 @@ fn classify_recording(
     }
 }
 
-fn auto_post_record_action(
-    task_trigger: &str,
-    status: &str,
-    disable_after_record: bool,
-) -> AutoPostRecordAction {
-    if task_trigger != "auto" {
-        AutoPostRecordAction::Preserve
-    } else if status == "completed" && !disable_after_record {
-        AutoPostRecordAction::Continue
-    } else {
-        AutoPostRecordAction::Disable
-    }
-}
-
 fn should_poll_auto_room(enabled: bool, expired: bool, running: bool, due: bool) -> bool {
     enabled && !expired && !running && due
 }
 
-fn monitor_until(window_hours: u64) -> String {
-    (Utc::now() + ChronoDuration::hours(window_hours as i64)).to_rfc3339()
+fn retry_is_due(room: &LiveRoom, now: DateTime<Utc>) -> bool {
+    room.auto_record_retry_at
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .is_none_or(|until| until <= now)
 }
 
-fn monitor_is_expired(until: Option<&str>) -> bool {
-    until
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .is_none_or(|value| value.with_timezone(&Utc) <= Utc::now())
-}
-
-fn daily_schedule_is_due(room: &LiveRoom, now: DateTime<Local>) -> bool {
-    let Some(daily_time) = room.auto_record_daily_time.as_deref() else {
-        return false;
-    };
-    let Ok(daily_time) = NaiveTime::parse_from_str(daily_time, "%H:%M") else {
-        return false;
-    };
-    let today = now.format("%Y-%m-%d").to_string();
-    room.last_schedule_trigger_date.as_deref() != Some(&today) && now.time() >= daily_time
-}
-
-fn initial_schedule_marker(daily_time: NaiveTime, now: DateTime<Local>) -> Option<String> {
-    (daily_time <= now.time()).then(|| now.format("%Y-%m-%d").to_string())
+fn set_retry(room: &mut LiveRoom, delay: u64, message: String) {
+    room.auto_record_retry_at =
+        Some((Utc::now() + ChronoDuration::seconds(delay as i64)).to_rfc3339());
+    room.auto_record_error = Some(message);
 }
 
 fn get_recordings_dir() -> Result<String, String> {
@@ -204,6 +176,10 @@ fn emit_auto_recording_event(
 
 fn apply_live_info(state: &AppState, room_id: i64, info: &LiveInfo) -> Result<LiveRoom, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
+    apply_live_info_in_db(&db, room_id, info)
+}
+
+fn apply_live_info_in_db(db: &Database, room_id: i64, info: &LiveInfo) -> Result<LiveRoom, String> {
     let room = db.get_room(room_id).map_err(|e| e.to_string())?;
     let anchor_name = if info.anchor_name.is_empty() {
         &room.anchor_name
@@ -283,74 +259,87 @@ fn remux_flv_to_mp4(file_path: &str) -> Result<(String, i64), String> {
     Ok((mp4_path, size))
 }
 
+// Called with the database lock held, before publishing a finished task.
 fn apply_post_recording_auto_policy(
-    app: &AppHandle,
     state: &AppState,
-    room_id: i64,
+    room: &mut LiveRoom,
     task_trigger: &str,
     status: &str,
-) -> Result<Option<LiveRoom>, String> {
-    let app_settings = settings::load_settings();
-    let current_room = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.get_room(room_id).map_err(|e| e.to_string())?
-    };
-    match auto_post_record_action(task_trigger, status, app_settings.auto_disable_after_record) {
-        AutoPostRecordAction::Continue => {
-            let until = monitor_until(app_settings.auto_monitor_window_hours);
-            let room = {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                db.set_room_auto_record(room_id, true, Some(&until))
-                    .map_err(|e| e.to_string())?;
-                db.get_room(room_id).map_err(|e| e.to_string())?
-            };
-            state.auto_recorder.mark_immediate(room_id);
-            emit_auto_recording_event(
-                app,
-                room.clone(),
-                "enabled",
-                Some("自动录制已完成，已开始新的监控窗口".to_string()),
-            );
-            return Ok(Some(room));
-        }
-        AutoPostRecordAction::Disable => {
-            let (reason, message) = if status == "completed" {
-                ("disabled", "自动录制已完成，本次监控已关闭")
+    exit: &RecordingExit,
+    verification: Option<LiveVerification>,
+    rate_limited: bool,
+) -> (&'static str, Option<String>) {
+    let settings = settings::load_settings();
+    let offline = matches!(verification, Some(LiveVerification::Offline));
+    match auto_policy::post_record_action(
+        room,
+        task_trigger,
+        status,
+        exit.manually_stopped,
+        offline,
+        settings.auto_disable_after_record,
+    ) {
+        PostRecordAction::Retry => {
+            let delay = if rate_limited {
+                state
+                    .auto_recorder
+                    .mark_failure(room.id, settings.auto_check_interval_secs, true)
             } else {
-                ("paused", "自动录制异常结束，已暂停该房间的自动监控")
+                state
+                    .auto_recorder
+                    .mark_recording_failure(room.id, settings.auto_check_interval_secs)
             };
-            let room = {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                db.set_room_auto_record(room_id, false, None)
-                    .map_err(|e| e.to_string())?;
-                db.get_room(room_id).map_err(|e| e.to_string())?
+            let message = if rate_limited {
+                "直播状态检测受到限制，等待 30 分钟后重试".to_string()
+            } else {
+                "录制异常结束，等待重试；将重新获取直播地址".to_string()
             };
-            state.auto_recorder.clear(room_id);
-            emit_auto_recording_event(app, room.clone(), reason, Some(message.to_string()));
-            return Ok(Some(room));
+            set_retry(room, delay, message.clone());
+            ("backoff", Some(message))
         }
-        AutoPostRecordAction::Preserve => {}
-    }
-    if current_room.auto_record_enabled {
-        if monitor_is_expired(current_room.auto_record_until.as_deref()) {
-            let room = {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                db.set_room_auto_record(room_id, false, None)
-                    .map_err(|e| e.to_string())?;
-                db.get_room(room_id).map_err(|e| e.to_string())?
-            };
-            state.auto_recorder.clear(room_id);
-            emit_auto_recording_event(
-                app,
-                room.clone(),
-                "window_expired",
-                Some("自动录制监控时间已结束".to_string()),
+        PostRecordAction::Continue | PostRecordAction::RenewWindow => {
+            room.auto_record_until = monitor_until(
+                room.auto_monitor_mode,
+                settings.auto_monitor_window_hours,
+                Utc::now(),
             );
-            return Ok(Some(room));
+            room.auto_record_error = None;
+            room.auto_record_retry_at = None;
+            state.auto_recorder.mark_immediate(room.id);
+            ("enabled", None)
         }
-        state.auto_recorder.mark_immediate(room_id);
+        PostRecordAction::Disable => {
+            auto_policy::set_enabled(room, false, settings.auto_monitor_window_hours, Utc::now());
+            state.auto_recorder.clear(room.id);
+            if status == "completed" {
+                (
+                    "disabled",
+                    Some("自动录制已完成，本次监控已关闭".to_string()),
+                )
+            } else {
+                let message = "自动录制异常结束，已暂停该房间的自动监控".to_string();
+                room.auto_record_error = Some(message.clone());
+                ("paused", Some(message))
+            }
+        }
+        PostRecordAction::Preserve => {
+            if room.auto_record_enabled && monitor_is_expired(room, Utc::now()) {
+                auto_policy::set_enabled(
+                    room,
+                    false,
+                    settings.auto_monitor_window_hours,
+                    Utc::now(),
+                );
+                state.auto_recorder.clear(room.id);
+                ("window_expired", Some("自动录制监控时间已结束".to_string()))
+            } else {
+                if room.auto_record_enabled {
+                    state.auto_recorder.mark_immediate(room.id);
+                }
+                ("state_changed", None)
+            }
+        }
     }
-    Ok(Some(current_room))
 }
 
 async fn handle_recording_exit(
@@ -366,6 +355,7 @@ async fn handle_recording_exit(
         if task.status != "recording" {
             return Ok(());
         }
+        state.auto_recorder.mark_recording_ended(room_id);
         let size = file_size(task.file_path.as_deref());
         db.mark_task_finalizing(task_id, size)
             .map_err(|e| e.to_string())?;
@@ -397,21 +387,38 @@ async fn handle_recording_exit(
             exit.stderr_tail.len()
         );
     }
-    let (verification, verified_room, verification_message) = if exit.manually_stopped {
-        (None, None, None)
+    let mut rate_limited = false;
+    let (verification, verification_message) = if exit.manually_stopped {
+        (None, None)
     } else {
-        match refresh_room_internal(&state, room_id).await {
-            Ok(room) if room.is_live => (
-                Some(LiveVerification::Live),
-                Some(room),
-                Some("录制进程已结束，但主播仍在直播，请检查网络后重新录制".to_string()),
-            ),
-            Ok(room) => (Some(LiveVerification::Offline), Some(room), None),
-            Err(error) => (
-                Some(LiveVerification::Failed),
-                None,
-                Some(format!("录制进程已结束，但无法确认直播状态: {}", error)),
-            ),
+        let room = {
+            let db = state.db.lock().map_err(|e| e.to_string())?;
+            db.get_room(room_id).map_err(|e| e.to_string())?
+        };
+        let url = format!("https://live.douyin.com/{}", room.room_id);
+        let result = state
+            .parser
+            .parse_douyin_url(&url, &settings::load_settings())
+            .await;
+        match result {
+            Ok(info) => {
+                apply_live_info(&state, room_id, &info)?;
+                if info.is_live {
+                    (
+                        Some(LiveVerification::Live),
+                        Some("录制进程已结束，但主播仍在直播".to_string()),
+                    )
+                } else {
+                    (Some(LiveVerification::Offline), None)
+                }
+            }
+            Err(error) => {
+                rate_limited = error.is_rate_limited();
+                (
+                    Some(LiveVerification::Failed),
+                    Some(format!("录制进程已结束，但无法确认直播状态: {}", error)),
+                )
+            }
         }
     };
     let status = classify_recording(original_size, &exit, verification);
@@ -457,28 +464,49 @@ async fn handle_recording_exit(
             }
         }
     }
-    let final_task = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.finish_task(task_id, status, final_path.as_deref(), final_size)
-            .map_err(|e| e.to_string())?;
-        db.get_task(task_id).map_err(|e| e.to_string())?
-    };
-    let policy_room =
-        apply_post_recording_auto_policy(&app, &state, room_id, &task_trigger, status)?;
+    // Completion and the next monitoring decision are committed together. Commands
+    // and ticks use this same lock, so they cannot publish an obsolete room snapshot.
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
+    let (auto_reason, auto_message) = apply_post_recording_auto_policy(
+        &state,
+        &mut room,
+        &task_trigger,
+        status,
+        &exit,
+        verification,
+        rate_limited,
+    );
+    let (final_task, room) = db
+        .finish_task_and_automation(task_id, status, final_path.as_deref(), final_size, &room)
+        .map_err(|e| e.to_string())?;
+    emit_auto_recording_event(&app, room.clone(), auto_reason, auto_message);
     let reason = match status {
         "completed" if exit.manually_stopped => "manual_stop",
         "completed" => "stream_ended",
         "interrupted" => "interrupted",
         _ => "failed",
     };
-    emit_recording_event(
-        &app,
-        final_task,
-        policy_room.or(verified_room),
-        reason,
-        message,
-    );
+    emit_recording_event(&app, final_task, Some(room), reason, message);
     Ok(())
+}
+
+#[derive(Debug)]
+enum StartRecordError {
+    Superseded,
+    AlreadyRunning,
+    Transient(String),
+    Fatal(String),
+}
+
+impl std::fmt::Display for StartRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Superseded => f.write_str("自动录制设置已变化或监控已结束"),
+            Self::AlreadyRunning => f.write_str("该直播间已经在录制或结束处理中"),
+            Self::Transient(message) | Self::Fatal(message) => f.write_str(message),
+        }
+    }
 }
 
 async fn start_record_from_info(
@@ -487,241 +515,221 @@ async fn start_record_from_info(
     room_id: i64,
     info: &LiveInfo,
     trigger: &str,
-) -> Result<RecordTask, String> {
+    expected_revision: Option<i64>,
+) -> Result<RecordTask, StartRecordError> {
     let _start_guard = state.start_lock.lock().await;
-    let (task_id, output_str, app_settings) = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        if db
-            .has_running_tasks_for_room(room_id)
-            .map_err(|e| e.to_string())?
-        {
-            return Err("该直播间已经在录制或结束处理中".to_string());
-        }
-        let room = db.get_room(room_id).map_err(|e| e.to_string())?;
-        if trigger == "auto"
-            && (!room.auto_record_enabled || monitor_is_expired(room.auto_record_until.as_deref()))
-        {
-            return Err("自动录制监控已关闭".to_string());
-        }
-        let task_id = db.add_task(room_id, trigger).map_err(|e| e.to_string())?;
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let filename = format!("{}_{}_{}.flv", room.anchor_name, room.room_id, timestamp);
-        let recordings_dir = get_recordings_dir()?;
-        let output_path = std::path::Path::new(&recordings_dir).join(filename);
-        let output_str = output_path.to_string_lossy().to_string();
-        db.update_task_status_and_path(task_id, "recording", Some(&output_str))
-            .map_err(|e| e.to_string())?;
-        (task_id, output_str, settings::load_settings())
-    };
-    let exit_app = app.clone();
-    let start_result = state.recorder.start_record(
-        task_id,
-        &info.stream_url,
-        &output_str,
-        &app_settings.proxy,
-        move |exit| handle_recording_exit(exit_app, task_id, room_id, exit),
+    // Register the process before a stop command can observe the new task.
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| StartRecordError::Fatal(e.to_string()))?;
+    let fatal = |e: rusqlite::Error| StartRecordError::Fatal(e.to_string());
+    if db.has_running_tasks_for_room(room_id).map_err(fatal)? {
+        return Err(StartRecordError::AlreadyRunning);
+    }
+    let mut room = db.get_room(room_id).map_err(fatal)?;
+    if trigger == "auto"
+        && !expected_revision
+            .is_some_and(|revision| auto_policy::accepts_check(&room, revision, false, Utc::now()))
+    {
+        return Err(StartRecordError::Superseded);
+    }
+    if info.stream_url.is_empty() {
+        return Err(StartRecordError::Transient(
+            "直播流地址为空，稍后重新检查".to_string(),
+        ));
+    }
+    let recordings_dir = get_recordings_dir().map_err(StartRecordError::Fatal)?;
+    let task_id = db.add_task(room_id, trigger).map_err(fatal)?;
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    // Task id also prevents a quick retry from overwriting an earlier partial file.
+    let filename = format!(
+        "{}_{}_{}_{}.flv",
+        room.anchor_name, room.room_id, timestamp, task_id
     );
-    if let Err(error) = start_result {
-        let (task, room) = {
-            let db = state.db.lock().map_err(|e| e.to_string())?;
-            db.finish_task(task_id, "failed", Some(&output_str), 0)
-                .map_err(|e| e.to_string())?;
-            (
-                db.get_task(task_id).map_err(|e| e.to_string())?,
-                db.get_room(room_id).ok(),
+    let output_str = std::path::Path::new(&recordings_dir)
+        .join(filename)
+        .to_string_lossy()
+        .to_string();
+    db.update_task_status_and_path(task_id, "recording", Some(&output_str))
+        .map_err(fatal)?;
+    let app_settings = settings::load_settings();
+    let exit_app = app.clone();
+    let start_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_str)
+        .map_err(|error| format!("无法创建录制文件: {}", error))
+        .and_then(|file| {
+            drop(file);
+            state.recorder.start_record(
+                task_id,
+                &info.stream_url,
+                &output_str,
+                &app_settings.proxy,
+                move |exit| handle_recording_exit(exit_app, task_id, room_id, exit),
             )
-        };
+        });
+    if let Err(error) = start_result {
+        db.finish_task(task_id, "failed", Some(&output_str), 0)
+            .map_err(fatal)?;
         emit_recording_event(
             app,
-            task,
-            room,
+            db.get_task(task_id).map_err(fatal)?,
+            Some(room),
             "failed",
             Some(format!("启动录制失败: {}", error)),
         );
-        return Err(error);
+        return Err(StartRecordError::Fatal(error));
     }
-    let db = state.db.lock().map_err(|e| e.to_string())?;
-    db.get_task(task_id).map_err(|e| e.to_string())
+    state.auto_recorder.mark_recording_started(room_id);
+    room.auto_record_error = None;
+    room.auto_record_retry_at = None;
+    let room = db.save_room_automation(&room).map_err(fatal)?;
+    let task = db.get_task(task_id).map_err(fatal)?;
+    if trigger == "auto" {
+        emit_recording_event(
+            app,
+            task.clone(),
+            Some(room),
+            "auto_started",
+            Some("检测到主播开播，已开始自动录制".to_string()),
+        );
+    } else {
+        emit_auto_recording_event(app, room, "state_changed", None);
+    }
+    Ok(task)
 }
 
-fn pause_auto_recording(
+fn handle_check_error(
     app: &AppHandle,
-    state: &AppState,
-    room_id: i64,
+    snapshot: &LiveRoom,
     message: String,
-) -> Result<LiveRoom, String> {
-    let room = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.set_room_auto_record(room_id, false, None)
-            .map_err(|e| e.to_string())?;
-        db.get_room(room_id).map_err(|e| e.to_string())?
+    rate_limited: bool,
+    fatal: bool,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut room = db.get_room(snapshot.id).map_err(|e| e.to_string())?;
+    let running = db
+        .has_running_tasks_for_room(room.id)
+        .map_err(|e| e.to_string())?;
+    if !auto_policy::accepts_check(&room, snapshot.auto_record_revision, running, Utc::now()) {
+        return Ok(());
+    }
+    let settings = settings::load_settings();
+    let (reason, message) = if fatal {
+        auto_policy::set_enabled(
+            &mut room,
+            false,
+            settings.auto_monitor_window_hours,
+            Utc::now(),
+        );
+        state.auto_recorder.clear(room.id);
+        let message = format!("自动录制无法启动，请处理后重新开启监控: {}", message);
+        room.auto_record_error = Some(message.clone());
+        ("paused", message)
+    } else {
+        let delay = state.auto_recorder.mark_failure(
+            room.id,
+            settings.auto_check_interval_secs,
+            rate_limited,
+        );
+        let message = if rate_limited {
+            format!("开播检测受到限制，等待 30 分钟后重试: {}", message)
+        } else {
+            format!("开播检测失败，等待重试: {}", message)
+        };
+        set_retry(&mut room, delay, message.clone());
+        ("backoff", message)
     };
-    state.auto_recorder.clear(room_id);
-    emit_auto_recording_event(app, room.clone(), "paused", Some(message));
-    Ok(room)
+    let room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
+    emit_auto_recording_event(app, room, reason, Some(message));
+    Ok(())
 }
 
-async fn check_auto_room(app: &AppHandle, room: LiveRoom) -> Result<(), String> {
+async fn check_auto_room(app: &AppHandle, snapshot: LiveRoom) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let app_settings = settings::load_settings();
-    let url = format!("https://live.douyin.com/{}", room.room_id);
-    let info = match state.parser.parse_douyin_url(&url, &app_settings).await {
+    let settings = settings::load_settings();
+    let url = format!("https://live.douyin.com/{}", snapshot.room_id);
+    let info = match state.parser.parse_douyin_url(&url, &settings).await {
         Ok(info) => info,
         Err(error) => {
-            let rate_limited = error.is_rate_limited();
-            state.auto_recorder.mark_failure(
-                room.id,
-                app_settings.auto_check_interval_secs,
-                rate_limited,
-            );
-            if rate_limited {
-                let current_room = {
-                    let db = state.db.lock().map_err(|e| e.to_string())?;
-                    db.get_room(room.id).map_err(|e| e.to_string())?
-                };
-                emit_auto_recording_event(
-                    app,
-                    current_room,
-                    "backoff",
-                    Some(format!(
-                        "开播检测受到抖音限制，已暂停请求 30 分钟后再试: {}",
-                        error
-                    )),
-                );
-            }
+            return handle_check_error(
+                app,
+                &snapshot,
+                error.to_string(),
+                error.is_rate_limited(),
+                false,
+            )
+        }
+    };
+    {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let room = db.get_room(snapshot.id).map_err(|e| e.to_string())?;
+        let running = db
+            .has_running_tasks_for_room(room.id)
+            .map_err(|e| e.to_string())?;
+        if !auto_policy::accepts_check(&room, snapshot.auto_record_revision, running, Utc::now()) {
             return Ok(());
         }
-    };
-    let current_room = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.get_room(room.id).map_err(|e| e.to_string())?
-    };
-    if !current_room.auto_record_enabled {
-        state.auto_recorder.clear(room.id);
-        return Ok(());
-    }
-    if monitor_is_expired(current_room.auto_record_until.as_deref()) {
-        let expired_room = {
-            let db = state.db.lock().map_err(|e| e.to_string())?;
-            db.set_room_auto_record(room.id, false, None)
-                .map_err(|e| e.to_string())?;
-            db.get_room(room.id).map_err(|e| e.to_string())?
-        };
-        state.auto_recorder.clear(room.id);
-        emit_auto_recording_event(
-            app,
-            expired_room,
-            "window_expired",
-            Some("自动录制监控时间已结束".to_string()),
-        );
-        return Ok(());
-    }
-    let updated_room = apply_live_info(&state, room.id, &info)?;
-    if !info.is_live {
-        state
-            .auto_recorder
-            .mark_success(room.id, app_settings.auto_check_interval_secs);
-        emit_auto_recording_event(app, updated_room, "enabled", None);
-        return Ok(());
-    }
-    match start_record_from_info(app, &state, room.id, &info, "auto").await {
-        Ok(task) => {
-            state.auto_recorder.clear(room.id);
-            emit_recording_event(
-                app,
-                task,
-                Some(updated_room),
-                "auto_started",
-                Some("检测到主播开播，已开始自动录制".to_string()),
-            );
-        }
-        Err(error) => {
-            let (already_running, current_room) = {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                (
-                    db.has_running_tasks_for_room(room.id)
-                        .map_err(|e| e.to_string())?,
-                    db.get_room(room.id).map_err(|e| e.to_string())?,
-                )
-            };
-            if already_running || !current_room.auto_record_enabled {
-                state.auto_recorder.clear(room.id);
-            } else if monitor_is_expired(current_room.auto_record_until.as_deref()) {
-                let expired_room = {
-                    let db = state.db.lock().map_err(|e| e.to_string())?;
-                    db.set_room_auto_record(room.id, false, None)
-                        .map_err(|e| e.to_string())?;
-                    db.get_room(room.id).map_err(|e| e.to_string())?
-                };
-                state.auto_recorder.clear(room.id);
-                emit_auto_recording_event(
-                    app,
-                    expired_room,
-                    "window_expired",
-                    Some("自动录制监控时间已结束".to_string()),
-                );
-            } else {
-                pause_auto_recording(
-                    app,
-                    &state,
-                    room.id,
-                    format!("自动录制启动失败，已暂停监控: {}", error),
-                )?;
-            }
+        let mut room = apply_live_info_in_db(&db, room.id, &info)?;
+        if !info.is_live {
+            state
+                .auto_recorder
+                .mark_success(room.id, settings.auto_check_interval_secs);
+            room.auto_record_error = None;
+            room.auto_record_retry_at = None;
+            let room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
+            emit_auto_recording_event(app, room, "enabled", None);
+            return Ok(());
         }
     }
-    Ok(())
+    match start_record_from_info(
+        app,
+        &state,
+        snapshot.id,
+        &info,
+        "auto",
+        Some(snapshot.auto_record_revision),
+    )
+    .await
+    {
+        Ok(_) | Err(StartRecordError::Superseded | StartRecordError::AlreadyRunning) => Ok(()),
+        Err(StartRecordError::Transient(message)) => {
+            handle_check_error(app, &snapshot, message, false, false)
+        }
+        Err(StartRecordError::Fatal(message)) => {
+            handle_check_error(app, &snapshot, message, false, true)
+        }
+    }
 }
 
 fn process_auto_deadlines_and_schedules(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let settings = settings::load_settings();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
     let now = Local::now();
-    let today = now.format("%Y-%m-%d").to_string();
-    let rooms = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.get_all_rooms().map_err(|e| e.to_string())?
-    };
-    for room in rooms {
-        let running = {
-            let db = state.db.lock().map_err(|e| e.to_string())?;
-            db.has_running_tasks_for_room(room.id)
-                .map_err(|e| e.to_string())?
+    for mut room in db.get_all_rooms().map_err(|e| e.to_string())? {
+        let running = db
+            .has_running_tasks_for_room(room.id)
+            .map_err(|e| e.to_string())?;
+        let action = auto_policy::tick(&mut room, running, settings.auto_monitor_window_hours, now);
+        let (reason, message) = match action {
+            TickAction::None => continue,
+            TickAction::Scheduled => {
+                if room.auto_record_retry_at.is_none() && !running {
+                    state.auto_recorder.mark_immediate(room.id);
+                }
+                ("schedule_triggered", "每日定时已触发，开始监控直播状态")
+            }
+            TickAction::Expired => {
+                state.auto_recorder.clear(room.id);
+                ("window_expired", "自动录制监控时间已结束")
+            }
         };
-        if room.auto_record_enabled
-            && monitor_is_expired(room.auto_record_until.as_deref())
-            && !running
-        {
-            let expired_room = {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                db.set_room_auto_record(room.id, false, None)
-                    .map_err(|e| e.to_string())?;
-                db.get_room(room.id).map_err(|e| e.to_string())?
-            };
-            state.auto_recorder.clear(room.id);
-            emit_auto_recording_event(
-                app,
-                expired_room,
-                "window_expired",
-                Some("自动录制监控时间已结束".to_string()),
-            );
-        }
-        if daily_schedule_is_due(&room, now) {
-            let app_settings = settings::load_settings();
-            let until = monitor_until(app_settings.auto_monitor_window_hours);
-            let scheduled_room = {
-                let db = state.db.lock().map_err(|e| e.to_string())?;
-                db.trigger_room_auto_schedule(room.id, &until, &today)
-                    .map_err(|e| e.to_string())?;
-                db.get_room(room.id).map_err(|e| e.to_string())?
-            };
-            state.auto_recorder.mark_immediate(room.id);
-            emit_auto_recording_event(
-                app,
-                scheduled_room,
-                "schedule_triggered",
-                Some("每日定时已触发，开始监控直播状态".to_string()),
-            );
-        }
+        let room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
+        emit_auto_recording_event(app, room, reason, Some(message.to_string()));
     }
     Ok(())
 }
@@ -729,14 +737,18 @@ fn process_auto_deadlines_and_schedules(app: &AppHandle) -> Result<(), String> {
 fn next_due_auto_room(app: &AppHandle) -> Result<Option<LiveRoom>, String> {
     let state = app.state::<AppState>();
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let rooms = db.get_all_rooms().map_err(|e| e.to_string())?;
-    for room in rooms {
-        let expired = monitor_is_expired(room.auto_record_until.as_deref());
+    let now = Utc::now();
+    for room in db.get_all_rooms().map_err(|e| e.to_string())? {
         let running = db
             .has_running_tasks_for_room(room.id)
             .map_err(|e| e.to_string())?;
-        let due = state.auto_recorder.is_due(room.id);
-        if should_poll_auto_room(room.auto_record_enabled, expired, running, due) {
+        let due = retry_is_due(&room, now) && state.auto_recorder.is_due(room.id);
+        if should_poll_auto_room(
+            room.auto_record_enabled,
+            monitor_is_expired(&room, now),
+            running,
+            due,
+        ) {
             return Ok(Some(room));
         }
     }
@@ -773,29 +785,11 @@ async fn auto_record_loop(app: AppHandle) {
     }
 }
 
-fn reconcile_auto_state_on_startup(
-    db: &Database,
-    app_settings: &AppSettings,
-) -> Result<(), String> {
+fn reconcile_auto_state_on_startup(db: &Database, settings: &AppSettings) -> Result<(), String> {
     let now = Local::now();
-    let today = now.format("%Y-%m-%d").to_string();
-    let rooms = db.get_all_rooms().map_err(|e| e.to_string())?;
-    for room in rooms {
-        if room.auto_record_enabled {
-            if room.auto_record_until.is_none() {
-                let until = monitor_until(app_settings.auto_monitor_window_hours);
-                db.set_room_auto_record(room.id, true, Some(&until))
-                    .map_err(|e| e.to_string())?;
-            } else if monitor_is_expired(room.auto_record_until.as_deref()) {
-                db.set_room_auto_record(room.id, false, None)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        if daily_schedule_is_due(&room, now) {
-            let until = monitor_until(app_settings.auto_monitor_window_hours);
-            db.trigger_room_auto_schedule(room.id, &until, &today)
-                .map_err(|e| e.to_string())?;
-        }
+    for mut room in db.get_all_rooms().map_err(|e| e.to_string())? {
+        auto_policy::reconcile(&mut room, settings.auto_monitor_window_hours, now);
+        db.save_room_automation(&room).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -877,14 +871,16 @@ fn set_room_auto_record(
     room_id: i64,
     enabled: bool,
 ) -> Result<LiveRoom, String> {
-    let until = enabled.then(|| monitor_until(settings::load_settings().auto_monitor_window_hours));
-    let room = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        db.get_room(room_id).map_err(|e| e.to_string())?;
-        db.set_room_auto_record(room_id, enabled, until.as_deref())
-            .map_err(|e| e.to_string())?;
-        db.get_room(room_id).map_err(|e| e.to_string())?
-    };
+    let settings = settings::load_settings();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
+    auto_policy::set_enabled(
+        &mut room,
+        enabled,
+        settings.auto_monitor_window_hours,
+        Utc::now(),
+    );
+    let room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
     if enabled {
         state.auto_recorder.mark_immediate(room_id);
     } else {
@@ -894,13 +890,55 @@ fn set_room_auto_record(
         &app,
         room.clone(),
         if enabled { "enabled" } else { "disabled" },
-        Some(if enabled {
-            "自动录制已开启，正在检查直播状态".to_string()
-        } else {
-            "自动录制已关闭；正在进行的录制不会停止".to_string()
-        }),
+        Some(
+            if enabled {
+                "自动录制已开启，正在检查直播状态"
+            } else {
+                "自动录制已关闭；正在进行的录制不会停止"
+            }
+            .to_string(),
+        ),
     );
     Ok(room)
+}
+
+fn save_room_auto_config(
+    app: &AppHandle,
+    state: &AppState,
+    room_id: i64,
+    mode: Option<AutoMonitorMode>,
+    daily_time: Option<String>,
+) -> Result<LiveRoom, String> {
+    let settings = settings::load_settings();
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
+    let mode = mode.unwrap_or(room.auto_monitor_mode);
+    auto_policy::configure(
+        &mut room,
+        mode,
+        daily_time,
+        settings.auto_monitor_window_hours,
+        Local::now(),
+    )?;
+    let room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
+    emit_auto_recording_event(
+        app,
+        room.clone(),
+        "configured",
+        Some("录制设置已保存".to_string()),
+    );
+    Ok(room)
+}
+
+#[tauri::command]
+fn set_room_auto_config(
+    app: AppHandle,
+    state: State<AppState>,
+    room_id: i64,
+    monitor_mode: AutoMonitorMode,
+    daily_time: Option<String>,
+) -> Result<LiveRoom, String> {
+    save_room_auto_config(&app, &state, room_id, Some(monitor_mode), daily_time)
 }
 
 #[tauri::command]
@@ -910,43 +948,7 @@ fn set_room_auto_schedule(
     room_id: i64,
     daily_time: Option<String>,
 ) -> Result<LiveRoom, String> {
-    let room = {
-        let db = state.db.lock().map_err(|e| e.to_string())?;
-        let existing = db.get_room(room_id).map_err(|e| e.to_string())?;
-        match daily_time.as_deref() {
-            Some(value) => {
-                let parsed = NaiveTime::parse_from_str(value, "%H:%M")
-                    .map_err(|_| "定时时间格式无效，请使用 HH:mm".to_string())?;
-                let marker = if existing.auto_record_daily_time.as_deref() == Some(value) {
-                    existing.last_schedule_trigger_date
-                } else {
-                    initial_schedule_marker(parsed, Local::now())
-                };
-                db.set_room_auto_schedule(room_id, Some(value), marker.as_deref())
-                    .map_err(|e| e.to_string())?;
-            }
-            None => db
-                .set_room_auto_schedule(room_id, None, None)
-                .map_err(|e| e.to_string())?,
-        }
-        db.get_room(room_id).map_err(|e| e.to_string())?
-    };
-    let scheduled = daily_time.is_some();
-    emit_auto_recording_event(
-        &app,
-        room.clone(),
-        if scheduled {
-            "scheduled"
-        } else {
-            "schedule_cancelled"
-        },
-        Some(if scheduled {
-            format!("已设置每天 {} 开启自动录制", daily_time.unwrap_or_default())
-        } else {
-            "已取消每日定时".to_string()
-        }),
-    );
-    Ok(room)
+    save_room_auto_config(&app, &state, room_id, None, daily_time)
 }
 
 #[tauri::command]
@@ -1010,7 +1012,9 @@ async fn start_record(
             .map_err(|e| e.to_string())?;
         return Err("主播未开播，任务已创建但未开始录制".to_string());
     }
-    start_record_from_info(&app, &state, room_id, &info, "manual").await
+    start_record_from_info(&app, &state, room_id, &info, "manual", None)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1032,6 +1036,22 @@ async fn stop_record(
     state: State<'_, AppState>,
     task_id: i64,
 ) -> Result<RecordTask, String> {
+    {
+        let _start_guard = state.start_lock.lock().await;
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let task = db.get_task(task_id).map_err(|e| e.to_string())?;
+        let mut room = db.get_room(task.room_id).map_err(|e| e.to_string())?;
+        if auto_policy::disable_for_manual_stop(&mut room, &task.status, Utc::now()) {
+            let room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
+            state.auto_recorder.clear(room.id);
+            emit_auto_recording_event(
+                &app,
+                room,
+                "disabled",
+                Some("已关闭持续监控，正在停止录制".to_string()),
+            );
+        }
+    }
     let was_active = state.recorder.stop_record(task_id).await?;
     if !was_active {
         let task = {
@@ -1108,6 +1128,7 @@ pub fn run() {
             refresh_room,
             set_room_auto_record,
             set_room_auto_schedule,
+            set_room_auto_config,
             delete_room,
             get_room_task_count,
             get_tasks,
@@ -1127,8 +1148,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_post_record_action, classify_recording, daily_schedule_is_due,
-        initial_schedule_marker, should_poll_auto_room, AutoPostRecordAction, LiveVerification,
+        classify_recording, daily_schedule_is_due, initial_schedule_marker, should_poll_auto_room,
+        LiveVerification,
     };
     use crate::database::LiveRoom;
     use crate::recorder::RecordingExit;
@@ -1149,6 +1170,7 @@ mod tests {
             auto_record_daily_time: Some(time.to_string()),
             auto_record_until: None,
             last_schedule_trigger_date: last_date.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -1244,26 +1266,6 @@ mod tests {
             Some("2026-08-21".to_string())
         );
         assert_eq!(initial_schedule_marker(future, now), None);
-    }
-
-    #[test]
-    fn automatic_recording_post_action_respects_trigger_and_setting() {
-        assert_eq!(
-            auto_post_record_action("auto", "completed", true),
-            AutoPostRecordAction::Disable
-        );
-        assert_eq!(
-            auto_post_record_action("auto", "completed", false),
-            AutoPostRecordAction::Continue
-        );
-        assert_eq!(
-            auto_post_record_action("auto", "interrupted", false),
-            AutoPostRecordAction::Disable
-        );
-        assert_eq!(
-            auto_post_record_action("manual", "completed", true),
-            AutoPostRecordAction::Preserve
-        );
     }
 
     #[test]

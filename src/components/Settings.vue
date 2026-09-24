@@ -64,7 +64,7 @@
           <div class="auto-setting-row">
             <div>
               <div class="auto-setting-label">单次监控窗口</div>
-              <div class="auto-setting-hint">到期仍未开播时自动停止请求</div>
+              <div class="auto-setting-hint">仅限时监控：到期仍未开播时自动停止请求</div>
             </div>
             <div class="number-setting">
               <el-input-number
@@ -80,16 +80,16 @@
           <div class="auto-setting-row">
             <div>
               <div class="auto-setting-label">自动录完一场后</div>
-              <div class="auto-setting-hint">仅影响由自动检测启动的录制</div>
+              <div class="auto-setting-hint">仅限时监控：影响由自动检测启动的录制</div>
             </div>
-            <el-select v-model="form.auto_disable_after_record" style="width: 142px">
+            <el-select v-model="form.auto_disable_after_record" style="width: 164px; flex-shrink: 0">
               <el-option label="关闭自动录制" :value="true" />
-              <el-option label="继续下一窗口" :value="false" />
+              <el-option label="重新开始一个窗口" :value="false" />
             </el-select>
           </div>
         </div>
         <div class="auto-settings-note">
-          未开启自动录制的房间仍只在程序启动和手动刷新时请求状态；录制期间不会轮询。
+          各房间可在“录制设置”中选择监控方式。持续监控不受窗口时长和录后选项影响；录制期间不会轮询。
         </div>
       </div>
 

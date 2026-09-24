@@ -1,3 +1,5 @@
+export type AutoMonitorMode = 'window' | 'continuous'
+
 export interface LiveRoom {
   id: number
   platform: string
@@ -9,6 +11,10 @@ export interface LiveRoom {
   is_live: boolean
   created_at: string
   auto_record_enabled: boolean
+  auto_monitor_mode: AutoMonitorMode
+  auto_record_retry_at: string | null
+  auto_record_error: string | null
+  auto_record_revision: number
   auto_record_daily_time: string | null
   auto_record_until: string | null
   last_schedule_trigger_date: string | null
@@ -55,6 +61,6 @@ export interface RecordingStatusChanged {
 
 export interface RoomAutoRecordingChanged {
   room: LiveRoom
-  reason: 'enabled' | 'disabled' | 'scheduled' | 'schedule_cancelled' | 'schedule_triggered' | 'window_expired' | 'paused' | 'backoff'
+  reason: 'enabled' | 'disabled' | 'scheduled' | 'schedule_cancelled' | 'schedule_triggered' | 'window_expired' | 'paused' | 'backoff' | 'configured' | 'state_changed'
   message: string | null
 }

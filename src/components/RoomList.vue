@@ -86,6 +86,7 @@
               <button
                 class="automation-chip"
                 :class="{ active: room.auto_record_enabled }"
+                :aria-pressed="room.auto_record_enabled"
                 :disabled="autoChangingIds.has(room.id)"
                 :title="room.auto_record_enabled ? '关闭后不会停止正在进行的录制' : '开启后按设置的间隔检查开播状态'"
                 @click="toggleAutoRecord(room)"
@@ -94,14 +95,19 @@
                 {{ getAutoRecordText(room) }}
               </button>
               <button
-                class="automation-chip schedule"
-                :class="{ active: !!room.auto_record_daily_time }"
-                title="设置每天开启自动录制的时间"
-                @click="openSchedule(room)"
+                class="automation-chip config"
+                title="设置监控方式和每日定时"
+                @click="openAutoConfig(room)"
               >
-                <el-icon :size="12"><Clock /></el-icon>
-                {{ room.auto_record_daily_time ? `每天 ${room.auto_record_daily_time}` : '定时开启' }}
+                <el-icon :size="12"><Setting /></el-icon>
+                录制设置
               </button>
+            </div>
+            <div class="automation-summary" :class="{ warning: !!room.auto_record_error }">
+              {{ getAutomationSummary(room) }}
+            </div>
+            <div v-if="room.auto_record_error" class="automation-error" :title="room.auto_record_error">
+              {{ room.auto_record_error }}
             </div>
           </div>
 
@@ -112,10 +118,12 @@
               :type="isRecording(room.id) ? 'warning' : 'primary'"
               @click="toggleRecord(room)"
               class="record-btn"
+              :disabled="isFinalizing(room.id)"
+              :title="isRecording(room.id) && room.auto_monitor_mode === 'continuous' && room.auto_record_enabled ? '停止当前录制，同时关闭该房间的持续监控' : undefined"
             >
               <el-icon v-if="isRecording(room.id)" class="btn-icon"><VideoPause /></el-icon>
               <el-icon v-else class="btn-icon"><VideoPlay /></el-icon>
-              {{ isRecording(room.id) ? '停止' : '录制' }}
+              {{ isFinalizing(room.id) ? '收尾中' : isRecording(room.id) ? '停止' : '录制' }}
             </el-button>
             <button
               class="icon-btn"
@@ -134,47 +142,56 @@
     </div>
 
     <el-dialog
-      v-model="scheduleVisible"
-      :title="`定时开启 · ${scheduleRoom?.anchor_name || '直播间'}`"
-      width="380"
+      v-model="autoConfigVisible"
+      :title="`录制设置 · ${configRoom?.anchor_name || '直播间'}`"
+      width="400"
+      :close-on-click-modal="!configSaving"
+      :show-close="!configSaving"
+      :close-on-press-escape="!configSaving"
       append-to-body
     >
-      <div class="schedule-dialog-body">
-        <div class="schedule-label">每天在此时间开启自动录制</div>
-        <el-time-picker
-          v-model="scheduleTime"
-          format="HH:mm"
-          value-format="HH:mm"
-          placeholder="选择时间"
-          style="width: 100%"
-        />
-        <div class="schedule-hint">
-          到点后会开始一个新的监控窗口；若所选时间今天已经过去，则从明天开始生效。
-        </div>
+      <div class="auto-config-body">
+        <div class="config-label">监控方式</div>
+        <el-radio-group v-model="monitorMode" :disabled="configSaving" aria-label="监控方式">
+          <el-radio-button value="window">限时监控</el-radio-button>
+          <el-radio-button value="continuous">持续监控</el-radio-button>
+        </el-radio-group>
+        <template v-if="monitorMode === 'continuous'">
+          <div class="mode-description">
+            持续等待主播开播，自动录制每一场。下播后继续等待，直到手动关闭自动录制。
+          </div>
+          <div v-if="scheduleTime" class="config-hint">
+            已保留每天 {{ scheduleTime }} 的定时设置。持续监控期间，每日定时不生效；切回限时监控后恢复。
+          </div>
+          <div class="config-hint">点击正在录制的视频的“停止”，也会关闭该房间的持续监控。</div>
+        </template>
+        <template v-else>
+          <div class="window-settings-summary">
+            <div><span>单次监控窗口</span><strong>{{ settings.auto_monitor_window_hours }} 小时</strong></div>
+            <div><span>自动录完一场后</span><strong>{{ settings.auto_disable_after_record ? '关闭自动录制' : '重新开始一个窗口' }}</strong></div>
+            <p>以上两项使用全局设置，可在主界面右上角的设置中调整。</p>
+          </div>
+          <label class="config-label" for="daily-auto-time">每日定时开启</label>
+          <el-time-picker
+            id="daily-auto-time"
+            v-model="scheduleTime"
+            format="HH:mm"
+            value-format="HH:mm"
+            placeholder="不设置定时"
+            :disabled="configSaving"
+            clearable
+            style="width: 100%"
+          />
+          <div class="config-hint">
+            到点后开启一个新的监控窗口；新设置或恢复定时时，若今天的时间已过，则从明天开始生效。清空时间可取消定时。
+          </div>
+        </template>
+        <div class="config-hint">保存设置不会改变自动录制的开关；已开启的监控会立即采用新模式。</div>
       </div>
       <template #footer>
-        <div class="schedule-footer">
-          <el-button
-            v-if="scheduleRoom?.auto_record_daily_time"
-            type="danger"
-            plain
-            :loading="scheduleSaving"
-            @click="cancelSchedule"
-          >
-            取消定时
-          </el-button>
-          <span v-else></span>
-          <div>
-            <el-button @click="scheduleVisible = false">关闭</el-button>
-            <el-button
-              type="primary"
-              :disabled="!scheduleTime"
-              :loading="scheduleSaving"
-              @click="saveSchedule"
-            >
-              保存
-            </el-button>
-          </div>
+        <div class="config-footer">
+          <el-button :disabled="configSaving" @click="autoConfigVisible = false">取消</el-button>
+          <el-button type="primary" :loading="configSaving" @click="saveAutoConfig">保存设置</el-button>
         </div>
       </template>
     </el-dialog>
@@ -184,21 +201,22 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
-import { Plus, Delete, VideoPlay, VideoPause, Refresh, Timer, Clock } from '@element-plus/icons-vue'
+import { Plus, Delete, VideoPlay, VideoPause, Refresh, Timer, Setting } from '@element-plus/icons-vue'
 import { useRecorderStore } from '../stores/recorder'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { LiveRoom } from '../types'
+import type { AutoMonitorMode, LiveRoom } from '../types'
 
 const store = useRecorderStore()
-const { rooms, tasks, loading, isRefreshingAll } = storeToRefs(store)
+const { rooms, tasks, settings, loading, isRefreshingAll } = storeToRefs(store)
 
 const newUrl = ref('')
 const refreshingIds = ref(new Set<number>())
 const autoChangingIds = ref(new Set<number>())
-const scheduleVisible = ref(false)
-const scheduleRoom = ref<LiveRoom | null>(null)
+const autoConfigVisible = ref(false)
+const configRoom = ref<LiveRoom | null>(null)
 const scheduleTime = ref<string | null>(null)
-const scheduleSaving = ref(false)
+const monitorMode = ref<AutoMonitorMode>('window')
+const configSaving = ref(false)
 const displayNow = ref(Date.now())
 let displayTimer: number | undefined
 
@@ -224,23 +242,45 @@ function isRecording(roomId: number) {
   return !!getActiveTask(roomId)
 }
 
+function isFinalizing(roomId: number) {
+  return tasks.value.some(task => task.room_id === roomId && task.status === 'finalizing')
+}
+
 function getAutoRecordText(room: LiveRoom) {
-  if (!room.auto_record_enabled) return '自动录制'
-  if (isRecording(room.id)) return '自动录制已开启'
-  if (!room.auto_record_until) return '自动监控中'
-  const remainingMs = new Date(room.auto_record_until).getTime() - displayNow.value
-  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return '监控即将结束'
-  const minutes = Math.max(1, Math.ceil(remainingMs / 60_000))
-  if (minutes < 60) return `监控剩余 ${minutes} 分钟`
+  return room.auto_record_enabled ? '自动录制：开启' : '自动录制：关闭'
+}
+
+function getAutomationSummary(room: LiveRoom) {
+  const mode = room.auto_monitor_mode === 'continuous' ? '持续监控' : '限时监控'
+  if (room.auto_record_error && !room.auto_record_enabled) return `${mode}已暂停 · 需要处理`
+  if (isFinalizing(room.id)) return `${mode} · 录制收尾中${room.auto_record_enabled ? '' : ' · 监控已关闭'}`
+  if (isRecording(room.id)) return `${mode} · 正在录制${room.auto_record_enabled ? '' : ' · 监控已关闭'}`
+  if (!room.auto_record_enabled) {
+    if (room.auto_monitor_mode === 'window' && room.auto_record_daily_time) {
+      return `限时监控 · 每天 ${room.auto_record_daily_time} 开启`
+    }
+    return `${mode} · 未开启`
+  }
+  if (room.auto_record_retry_at) {
+    const remaining = new Date(room.auto_record_retry_at).getTime() - displayNow.value
+    return remaining > 0 ? `${mode} · 等待重试（约 ${Math.max(1, Math.ceil(remaining / 60_000))} 分钟）` : `${mode} · 正在重试`
+  }
+  if (room.auto_monitor_mode === 'continuous') return '持续监控中 · 等待开播'
+  const remaining = new Date(room.auto_record_until || '').getTime() - displayNow.value
+  if (!Number.isFinite(remaining) || remaining <= 0) return '限时监控 · 即将结束'
+  const minutes = Math.max(1, Math.ceil(remaining / 60_000))
   const hours = Math.floor(minutes / 60)
   const rest = minutes % 60
-  return rest ? `监控剩余 ${hours} 小时 ${rest} 分` : `监控剩余 ${hours} 小时`
+  const duration = hours ? `${hours} 小时${rest ? ` ${rest} 分` : ''}` : `${minutes} 分钟`
+  const schedule = room.auto_record_daily_time ? ` · 每天 ${room.auto_record_daily_time}` : ''
+  return `监控剩余 ${duration}${schedule}`
 }
 
 async function toggleAutoRecord(room: LiveRoom) {
   autoChangingIds.value.add(room.id)
   try {
     await store.setRoomAutoRecord(room.id, !room.auto_record_enabled)
+    displayNow.value = Date.now()
   } catch (e) {
     ElMessage.error(`修改自动录制失败: ${e}`)
   } finally {
@@ -248,36 +288,25 @@ async function toggleAutoRecord(room: LiveRoom) {
   }
 }
 
-function openSchedule(room: LiveRoom) {
-  scheduleRoom.value = room
+function openAutoConfig(room: LiveRoom) {
+  configRoom.value = room
   scheduleTime.value = room.auto_record_daily_time
-  scheduleVisible.value = true
+  monitorMode.value = room.auto_monitor_mode
+  autoConfigVisible.value = true
 }
 
-async function saveSchedule() {
-  if (!scheduleRoom.value || !scheduleTime.value) return
-  scheduleSaving.value = true
+async function saveAutoConfig() {
+  if (!configRoom.value) return
+  configSaving.value = true
   try {
-    const updated = await store.setRoomAutoSchedule(scheduleRoom.value.id, scheduleTime.value)
-    scheduleRoom.value = updated
-    scheduleVisible.value = false
+    const updated = await store.setRoomAutoConfig(configRoom.value.id, monitorMode.value, scheduleTime.value)
+    configRoom.value = updated
+    displayNow.value = Date.now()
+    autoConfigVisible.value = false
   } catch (e) {
-    ElMessage.error(`保存定时失败: ${e}`)
+    ElMessage.error(`保存录制设置失败: ${e}`)
   } finally {
-    scheduleSaving.value = false
-  }
-}
-
-async function cancelSchedule() {
-  if (!scheduleRoom.value) return
-  scheduleSaving.value = true
-  try {
-    await store.setRoomAutoSchedule(scheduleRoom.value.id, null)
-    scheduleVisible.value = false
-  } catch (e) {
-    ElMessage.error(`取消定时失败: ${e}`)
-  } finally {
-    scheduleSaving.value = false
+    configSaving.value = false
   }
 }
 
@@ -645,11 +674,6 @@ async function deleteRoom(room: LiveRoom) {
   background: var(--color-success-light);
 }
 
-.automation-chip.schedule.active {
-  color: var(--color-primary);
-  background: var(--color-primary-light);
-}
-
 .automation-chip:disabled {
   opacity: 0.55;
   cursor: wait;
@@ -700,29 +724,74 @@ async function deleteRoom(room: LiveRoom) {
   color: var(--color-danger);
 }
 
-.schedule-dialog-body {
+.auto-config-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
-.schedule-label {
+.config-label {
   font-size: 13px;
   font-weight: 600;
   color: var(--color-text);
 }
 
-.schedule-hint {
+.config-hint {
   font-size: 11px;
   line-height: 1.6;
   color: var(--color-text-tertiary);
 }
 
-.schedule-footer {
+.config-footer {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
+  gap: 8px;
 }
+
+.automation-summary {
+  margin-top: 6px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.automation-summary.warning, .automation-error {
+  color: var(--color-warning);
+}
+
+.automation-error {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.mode-description {
+  padding: 12px;
+  background: var(--color-primary-light);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  line-height: 1.8;
+}
+
+.window-settings-summary {
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+  font-size: 12px;
+}
+
+.window-settings-summary > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.window-settings-summary strong { font-weight: 500; }
+.window-settings-summary p { font-size: 11px; color: var(--color-text-secondary); line-height: 1.6; }
 
 /* ── Transition ── */
 .room-enter-active {
