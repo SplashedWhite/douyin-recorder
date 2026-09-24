@@ -32,6 +32,7 @@ export interface RecordTask {
 }
 
 export interface AppSettings {
+  close_behavior: 'exit' | 'tray'
   proxy: string
   cookie: string
   quality: string
@@ -44,6 +45,12 @@ export interface AppSettings {
   auto_monitor_window_hours: number
   auto_disable_after_record: boolean
   notify_updates: boolean
+}
+
+export interface LifecycleStatus {
+  exiting: boolean
+  revision: number
+  message: string | null
 }
 
 export interface UpdateInfo {

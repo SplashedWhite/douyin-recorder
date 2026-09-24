@@ -74,6 +74,7 @@ mod tests {
                 parser: DouyinParser::new(),
                 auto_recorder: AutoRecorder::new(),
                 start_lock: AsyncMutex::new(()),
+                lifecycle: Default::default(),
             });
             Self { state, config, dir }
         }

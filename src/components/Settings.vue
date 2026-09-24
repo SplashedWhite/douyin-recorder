@@ -3,6 +3,19 @@
     <div class="settings-body">
       <div class="settings-section">
         <div class="section-header">
+          <span class="section-label">点击关闭按钮时</span>
+        </div>
+        <el-select v-model="form.close_behavior" size="large" style="width: 100%">
+          <el-option label="直接退出程序" value="exit" />
+          <el-option label="关闭到系统托盘" value="tray" />
+        </el-select>
+        <div class="quality-note">
+          关闭到托盘后继续录制和监控，点击托盘图标恢复窗口。直接退出会先停止录制并保存文件。
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header">
           <span class="section-label">代理设置</span>
           <span class="section-hint">留空则不使用代理</span>
         </div>
@@ -194,6 +207,7 @@ import { useRecorderStore } from '../stores/recorder'
 import { DEFAULT_QUALITY, QUALITY_OPTIONS, normalizeQuality } from '../constants/quality'
 import { getVersion } from '@tauri-apps/api/app'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import type { AppSettings } from '../types'
 
 const visible = defineModel<boolean>({ default: false })
 const store = useRecorderStore()
@@ -208,6 +222,7 @@ const version = ref('')
 getVersion().then(v => { version.value = v })
 
 const form = reactive({
+  close_behavior: 'exit' as AppSettings['close_behavior'],
   proxy: '',
   cookie: '',
   quality: DEFAULT_QUALITY,
@@ -222,6 +237,7 @@ const form = reactive({
 })
 
 function onOpen() {
+  form.close_behavior = store.settings.close_behavior ?? 'exit'
   form.proxy = store.settings.proxy
   form.cookie = store.settings.cookie
   form.quality = normalizeQuality(store.settings.quality)

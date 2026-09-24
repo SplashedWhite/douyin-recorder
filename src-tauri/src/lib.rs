@@ -1,6 +1,8 @@
 mod auto_policy;
 mod auto_recorder;
 mod database;
+mod desktop;
+mod lifecycle;
 mod migration;
 mod parser;
 mod recorder;
@@ -18,7 +20,7 @@ use parser::{DouyinParser, LiveInfo};
 use recorder::{Recorder, RecordingExit};
 use serde::Serialize;
 use settings::AppSettings;
-use std::sync::Mutex;
+use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex as AsyncMutex;
@@ -58,6 +60,7 @@ struct AppState {
     parser: DouyinParser,
     auto_recorder: AutoRecorder,
     start_lock: AsyncMutex<()>,
+    lifecycle: Arc<lifecycle::Lifecycle>,
 }
 
 #[derive(Clone, Serialize)]
@@ -468,15 +471,22 @@ async fn handle_recording_exit(
     // and ticks use this same lock, so they cannot publish an obsolete room snapshot.
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
-    let (auto_reason, auto_message) = apply_post_recording_auto_policy(
-        &state,
-        &mut room,
-        &task_trigger,
-        status,
-        &exit,
-        verification,
-        rate_limited,
-    );
+    let (auto_reason, auto_message) =
+        if state.lifecycle.is_exiting() || state.recorder.stopped_for_exit(task_id) {
+            // Application shutdown must not consume a monitoring window or change
+            // the user's auto-record intent, even if a timed-out shutdown was cancelled.
+            ("state_changed", None)
+        } else {
+            apply_post_recording_auto_policy(
+                &state,
+                &mut room,
+                &task_trigger,
+                status,
+                &exit,
+                verification,
+                rate_limited,
+            )
+        };
     let (final_task, room) = db
         .finish_task_and_automation(task_id, status, final_path.as_deref(), final_size, &room)
         .map_err(|e| e.to_string())?;
@@ -518,6 +528,9 @@ async fn start_record_from_info(
     expected_revision: Option<i64>,
 ) -> Result<RecordTask, StartRecordError> {
     let _start_guard = state.start_lock.lock().await;
+    if state.lifecycle.is_exiting() {
+        return Err(StartRecordError::Superseded);
+    }
     // Register the process before a stop command can observe the new task.
     let db = state
         .db
@@ -609,6 +622,9 @@ fn handle_check_error(
     fatal: bool,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
+    if state.lifecycle.is_exiting() {
+        return Ok(());
+    }
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut room = db.get_room(snapshot.id).map_err(|e| e.to_string())?;
     let running = db
@@ -650,6 +666,9 @@ fn handle_check_error(
 
 async fn check_auto_room(app: &AppHandle, snapshot: LiveRoom) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let Ok(_operation) = state.lifecycle.operation() else {
+        return Ok(());
+    };
     let settings = settings::load_settings();
     let url = format!("https://live.douyin.com/{}", snapshot.room_id);
     let info = match state.parser.parse_douyin_url(&url, &settings).await {
@@ -664,6 +683,9 @@ async fn check_auto_room(app: &AppHandle, snapshot: LiveRoom) -> Result<(), Stri
             )
         }
     };
+    if state.lifecycle.is_exiting() {
+        return Ok(());
+    }
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let room = db.get_room(snapshot.id).map_err(|e| e.to_string())?;
@@ -707,6 +729,9 @@ async fn check_auto_room(app: &AppHandle, snapshot: LiveRoom) -> Result<(), Stri
 
 fn process_auto_deadlines_and_schedules(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let Ok(_operation) = state.lifecycle.operation() else {
+        return Ok(());
+    };
     let settings = settings::load_settings();
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let now = Local::now();
@@ -736,6 +761,9 @@ fn process_auto_deadlines_and_schedules(app: &AppHandle) -> Result<(), String> {
 
 fn next_due_auto_room(app: &AppHandle) -> Result<Option<LiveRoom>, String> {
     let state = app.state::<AppState>();
+    if state.lifecycle.is_exiting() {
+        return Ok(None);
+    }
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let now = Utc::now();
     for room in db.get_all_rooms().map_err(|e| e.to_string())? {
@@ -807,12 +835,19 @@ fn save_settings_cmd(
     state: State<AppState>,
     new_settings: AppSettings,
 ) -> Result<AppSettings, String> {
-    migration::save_settings(&state, new_settings, &settings::settings_path())
+    let _operation = state.lifecycle.operation()?;
+    let saved = migration::save_settings(&state, new_settings, &settings::settings_path())?;
+    state.lifecycle.close_to_tray.store(
+        saved.close_behavior == settings::CloseBehavior::Tray,
+        Ordering::Release,
+    );
+    Ok(saved)
 }
 
 #[tauri::command]
 async fn migrate_db_cmd(app: AppHandle, new_path: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
+        let _operation = app.state::<AppState>().lifecycle.operation()?;
         migration::migrate_database(
             &app.state::<AppState>(),
             &new_path,
@@ -838,6 +873,7 @@ fn get_rooms(state: State<AppState>) -> Result<Vec<LiveRoom>, String> {
 
 #[tauri::command]
 async fn add_room(state: State<'_, AppState>, url: String) -> Result<LiveRoom, String> {
+    let _operation = state.lifecycle.operation()?;
     let app_settings = settings::load_settings();
     let info = state
         .parser
@@ -861,6 +897,7 @@ async fn add_room(state: State<'_, AppState>, url: String) -> Result<LiveRoom, S
 
 #[tauri::command]
 async fn refresh_room(state: State<'_, AppState>, room_id: i64) -> Result<LiveRoom, String> {
+    let _operation = state.lifecycle.operation()?;
     refresh_room_internal(&state, room_id).await
 }
 
@@ -871,6 +908,7 @@ fn set_room_auto_record(
     room_id: i64,
     enabled: bool,
 ) -> Result<LiveRoom, String> {
+    let _operation = state.lifecycle.operation()?;
     let settings = settings::load_settings();
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
@@ -909,6 +947,7 @@ fn save_room_auto_config(
     mode: Option<AutoMonitorMode>,
     daily_time: Option<String>,
 ) -> Result<LiveRoom, String> {
+    let _operation = state.lifecycle.operation()?;
     let settings = settings::load_settings();
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
@@ -959,6 +998,7 @@ fn get_room_task_count(state: State<AppState>, room_id: i64) -> Result<i64, Stri
 
 #[tauri::command]
 fn delete_room(state: State<AppState>, id: i64, cascade: Option<bool>) -> Result<(), String> {
+    let _operation = state.lifecycle.operation()?;
     {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         if db
@@ -993,6 +1033,7 @@ async fn start_record(
     state: State<'_, AppState>,
     room_id: i64,
 ) -> Result<RecordTask, String> {
+    let _operation = state.lifecycle.operation()?;
     let douyin_url = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let room = db.get_room(room_id).map_err(|e| e.to_string())?;
@@ -1005,6 +1046,7 @@ async fn start_record(
         .await
         .map_err(|e| e.to_string())?;
     apply_live_info(&state, room_id, &info)?;
+    state.lifecycle.ensure_running()?;
     if !info.is_live {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let task_id = db.add_task(room_id, "manual").map_err(|e| e.to_string())?;
@@ -1019,6 +1061,7 @@ async fn start_record(
 
 #[tauri::command]
 fn delete_task(state: State<AppState>, id: i64) -> Result<(), String> {
+    let _operation = state.lifecycle.operation()?;
     if state.recorder.is_active(id) {
         return Err("该任务正在录制或结束处理中，请先停止录制".to_string());
     }
@@ -1036,6 +1079,7 @@ async fn stop_record(
     state: State<'_, AppState>,
     task_id: i64,
 ) -> Result<RecordTask, String> {
+    let _operation = state.lifecycle.operation()?;
     {
         let _start_guard = state.start_lock.lock().await;
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -1080,7 +1124,21 @@ async fn stop_record(
 }
 
 #[tauri::command]
-fn convert_to_mp4(state: State<AppState>, task_id: i64) -> Result<String, String> {
+async fn convert_to_mp4(app: AppHandle, task_id: i64) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _operation = state.lifecycle.operation()?;
+        let result = convert_task_to_mp4(&state, task_id);
+        if let Err(error) = &result {
+            state.lifecycle.record_failure(error.clone());
+        }
+        result
+    })
+    .await
+    .map_err(|e| format!("转换任务异常: {e}"))?
+}
+
+fn convert_task_to_mp4(state: &AppState, task_id: i64) -> Result<String, String> {
     let task = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         db.get_task(task_id).map_err(|e| e.to_string())?
@@ -1101,26 +1159,41 @@ fn convert_to_mp4(state: State<AppState>, task_id: i64) -> Result<String, String
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let db_path = settings::get_db_path();
-    let db = Database::new(&db_path).expect("数据库初始化失败");
-    db.reconcile_incomplete_tasks()
-        .expect("修复未完成录制任务失败");
-    let app_settings = settings::load_settings();
-    reconcile_auto_state_on_startup(&db, &app_settings).expect("修复自动录制状态失败");
-    let recorder = Recorder::new(resolve_ffmpeg_path());
     tauri::Builder::default()
+        // This must run before database reconciliation or any background task.
+        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            desktop::request_restore(app)
+        }))
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            db: Mutex::new(db),
-            recorder,
-            parser: DouyinParser::new(),
-            auto_recorder: AutoRecorder::new(),
-            start_lock: AsyncMutex::new(()),
-        })
         .setup(|app| {
+            let db = Database::new(&settings::get_db_path())?;
+            db.reconcile_incomplete_tasks()?;
+            let app_settings = settings::load_settings();
+            reconcile_auto_state_on_startup(&db, &app_settings).map_err(std::io::Error::other)?;
+            let lifecycle = Arc::new(lifecycle::Lifecycle::default());
+            lifecycle.close_to_tray.store(
+                app_settings.close_behavior == settings::CloseBehavior::Tray,
+                Ordering::Release,
+            );
+            app.manage(AppState {
+                db: Mutex::new(db),
+                recorder: Recorder::new(resolve_ffmpeg_path()),
+                parser: DouyinParser::new(),
+                auto_recorder: AutoRecorder::new(),
+                start_lock: AsyncMutex::new(()),
+                lifecycle,
+            });
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(auto_record_loop(app_handle));
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    desktop::request_close(window.app_handle());
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_rooms,
@@ -1140,9 +1213,20 @@ pub fn run() {
             save_settings_cmd,
             migrate_db_cmd,
             check_for_update,
+            desktop::get_lifecycle_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("应用启动失败");
+        .build(tauri::generate_context!())
+        .expect("应用启动失败")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    if !state.lifecycle.allow_exit.load(Ordering::Acquire) {
+                        api.prevent_exit();
+                        desktop::request_exit(app);
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]

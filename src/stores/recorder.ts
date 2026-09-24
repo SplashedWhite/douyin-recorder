@@ -28,6 +28,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   const isRefreshingAll = ref(false)
   const availableUpdate = ref<UpdateInfo | null>(null)
   const settings = ref<AppSettings>({
+    close_behavior: 'exit',
     proxy: '',
     cookie: '',
     quality: DEFAULT_QUALITY,

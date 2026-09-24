@@ -13,7 +13,7 @@ use std::os::windows::process::CommandExt;
 
 const STDERR_TAIL_LINES: usize = 50;
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+pub const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub struct RecordingExit {
@@ -93,6 +93,27 @@ async fn stop_ffmpeg(
 struct ActiveRecording {
     stop_tx: Option<oneshot::Sender<()>>,
     completion_rx: watch::Receiver<Option<Result<(), String>>>,
+    stopped_for_exit: bool,
+}
+
+pub struct Completion {
+    task_id: i64,
+    receiver: watch::Receiver<Option<Result<(), String>>>,
+}
+
+impl Completion {
+    pub async fn wait(mut self) -> Result<(), String> {
+        loop {
+            if let Some(result) = self.receiver.borrow().clone() {
+                return result
+                    .map_err(|error| format!("任务 {} 收尾失败: {}", self.task_id, error));
+            }
+            self.receiver
+                .changed()
+                .await
+                .map_err(|_| format!("任务 {} 的录制进程状态通道已关闭", self.task_id))?;
+        }
+    }
 }
 
 pub struct Recorder {
@@ -199,6 +220,7 @@ impl Recorder {
                 ActiveRecording {
                     stop_tx: Some(stop_tx),
                     completion_rx,
+                    stopped_for_exit: false,
                 },
             );
         }
@@ -267,6 +289,35 @@ impl Recorder {
             .map_err(|e| e.to_string())
     }
 
+    // Send every stop request before awaiting any completion, including records
+    // already converting or committing their final database update.
+    pub fn request_stop_all_for_exit(&self) -> Result<Vec<Completion>, String> {
+        let mut records = self.active_records.lock().map_err(|e| e.to_string())?;
+        let mut completions = Vec::with_capacity(records.len());
+        for (&task_id, recording) in records.iter_mut() {
+            recording.stopped_for_exit = true;
+            completions.push(Completion {
+                task_id,
+                receiver: recording.completion_rx.clone(),
+            });
+            if let Some(sender) = recording.stop_tx.take() {
+                let _ = sender.send(());
+            }
+        }
+        Ok(completions)
+    }
+
+    pub fn stopped_for_exit(&self, task_id: i64) -> bool {
+        self.active_records
+            .lock()
+            .map(|records| {
+                records
+                    .get(&task_id)
+                    .is_some_and(|record| record.stopped_for_exit)
+            })
+            .unwrap_or(false)
+    }
+
     pub fn is_active(&self, task_id: i64) -> bool {
         self.active_records
             .lock()
@@ -302,6 +353,69 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("binaries")
             .join("ffmpeg-x86_64-pc-windows-msvc.exe")
+    }
+
+    #[tokio::test]
+    async fn exit_requests_stop_every_record_and_waits_for_finalization_errors() {
+        let recorder = Recorder::new("unused-ffmpeg".into());
+        let mut stops = Vec::new();
+        let mut completions = Vec::new();
+        for task_id in 1..=3 {
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let (complete_tx, complete_rx) = tokio::sync::watch::channel(None);
+            recorder.active_records.lock().unwrap().insert(
+                task_id,
+                super::ActiveRecording {
+                    stop_tx: Some(stop_tx),
+                    completion_rx: complete_rx,
+                    stopped_for_exit: false,
+                },
+            );
+            stops.push(stop_rx);
+            completions.push(complete_tx);
+        }
+        let pending = recorder.request_stop_all_for_exit().unwrap();
+        let duplicate = recorder.request_stop_all_for_exit().unwrap();
+        for mut stop in stops {
+            assert!(stop.try_recv().is_ok());
+        }
+        for task_id in 1..=3 {
+            assert!(recorder.stopped_for_exit(task_id));
+        }
+        let waiting = tokio::spawn(async move {
+            let mut errors = Vec::new();
+            for completion in pending {
+                if let Err(error) = completion.wait().await {
+                    errors.push(error);
+                }
+            }
+            errors
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "process exit alone must not bypass file conversion/DB finalization"
+        );
+        for (index, complete) in completions.iter().enumerate() {
+            complete
+                .send(Some(if index == 1 {
+                    Err("数据库保存失败".into())
+                } else {
+                    Ok(())
+                }))
+                .unwrap();
+        }
+        assert_eq!(
+            waiting.await.unwrap(),
+            vec!["任务 2 收尾失败: 数据库保存失败"]
+        );
+        let mut failures = 0;
+        for completion in duplicate {
+            if completion.wait().await.is_err() {
+                failures += 1;
+            }
+        }
+        assert_eq!(failures, 1);
     }
 
     fn assert_complete_flv(path: &Path) -> f64 {
@@ -559,6 +673,7 @@ mod tests {
             super::ActiveRecording {
                 stop_tx: None,
                 completion_rx,
+                stopped_for_exit: false,
             },
         );
         let state = AppState {
@@ -567,6 +682,7 @@ mod tests {
             parser: DouyinParser::new(),
             auto_recorder: AutoRecorder::new(),
             start_lock: tokio::sync::Mutex::new(()),
+            lifecycle: Default::default(),
         };
         let target = dir.path().join("target.db");
         let config = dir.path().join("settings.json");

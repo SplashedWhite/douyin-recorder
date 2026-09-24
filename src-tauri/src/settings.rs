@@ -19,6 +19,14 @@ where
     Ok(normalize_quality(&quality).to_string())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseBehavior {
+    #[default]
+    Exit,
+    Tray,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -35,6 +43,7 @@ pub struct AppSettings {
     pub auto_monitor_window_hours: u64,
     pub auto_disable_after_record: bool,
     pub notify_updates: bool,
+    pub close_behavior: CloseBehavior,
 }
 
 impl Default for AppSettings {
@@ -64,6 +73,7 @@ impl Default for AppSettings {
             auto_monitor_window_hours: 6,
             auto_disable_after_record: true,
             notify_updates: true,
+            close_behavior: CloseBehavior::Exit,
         }
     }
 }
@@ -136,6 +146,24 @@ pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{load_settings_from, save_settings_at, AppSettings};
+
+    #[test]
+    fn close_behavior_defaults_and_round_trips_without_losing_settings() {
+        use super::CloseBehavior;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"quality":"HD1","notify_updates":false}"#).unwrap();
+        let mut settings = load_settings_from(&path).unwrap();
+        assert_eq!(settings.close_behavior, CloseBehavior::Exit);
+        for behavior in [CloseBehavior::Tray, CloseBehavior::Exit] {
+            settings.close_behavior = behavior;
+            save_settings_at(&settings, &path).unwrap();
+            let loaded = load_settings_from(&path).unwrap();
+            assert_eq!(loaded.close_behavior, behavior);
+            assert_eq!(loaded.quality, "HD1");
+            assert!(!loaded.notify_updates);
+        }
+    }
 
     #[test]
     fn new_missing_and_invalid_quality_settings_use_origin() {

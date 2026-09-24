@@ -39,6 +39,19 @@
       </main>
 
       <Settings v-model="showSettings" />
+      <el-dialog
+        :model-value="lifecycleStatus.exiting"
+        title="正在退出"
+        width="380"
+        :show-close="false"
+        :close-on-click-modal="false"
+        :close-on-press-escape="false"
+        :z-index="5000"
+        append-to-body
+      >
+        <p>正在停止录制并保存文件，请稍候。录制收尾和转换完成后将自动退出。</p>
+        <el-progress :percentage="100" :indeterminate="true" :show-text="false" />
+      </el-dialog>
     </div>
   </div>
 </template>
@@ -47,6 +60,9 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { Setting, TopRight } from '@element-plus/icons-vue'
 import { openUrl } from '@tauri-apps/plugin-opener'
+import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { LifecycleStatus } from './types'
 import { ElMessage } from 'element-plus'
 import { useRecorderStore } from './stores/recorder'
 import RoomList from './components/RoomList.vue'
@@ -55,6 +71,14 @@ import Settings from './components/Settings.vue'
 
 const store = useRecorderStore()
 const showSettings = ref(false)
+const lifecycleStatus = ref<LifecycleStatus>({ exiting: false, revision: -1, message: null })
+let unlistenLifecycle: UnlistenFn | undefined
+
+function applyLifecycleStatus(status: LifecycleStatus) {
+  if (status.revision <= lifecycleStatus.value.revision) return
+  lifecycleStatus.value = status
+  if (status.message) ElMessage.error({ message: status.message, duration: 8000 })
+}
 
 async function openLatestRelease() {
   const update = store.availableUpdate
@@ -68,6 +92,8 @@ async function openLatestRelease() {
 }
 
 onMounted(async () => {
+  unlistenLifecycle = await listen<LifecycleStatus>('lifecycle-status-changed', ({ payload }) => applyLifecycleStatus(payload))
+  applyLifecycleStatus(await invoke<LifecycleStatus>('get_lifecycle_status'))
   await store.listenRecordingEvents()
   await Promise.all([
     store.loadRooms(),
@@ -80,6 +106,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  unlistenLifecycle?.()
   store.stopListeningRecordingEvents()
 })
 </script>
