@@ -181,6 +181,38 @@
 
       <div class="settings-section">
         <div class="section-header">
+          <span class="section-label">诊断日志</span>
+          <span class="section-hint">自动保存，方便排查录制问题</span>
+        </div>
+        <div class="auto-settings-panel log-retention">
+          <div class="auto-setting-row">
+            <span class="auto-setting-label">单个日志大小</span>
+            <div class="number-setting">
+              <el-input-number v-model="form.log_max_size_mib" aria-label="单个日志大小" :min="1" :max="1024" :precision="0" :step="1" controls-position="right" />
+              <span>MiB</span>
+            </div>
+          </div>
+          <div class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">历史日志保留份数</div>
+              <div class="auto-setting-hint">不含当前正在写入的文件</div>
+            </div>
+            <div class="number-setting">
+              <el-input-number v-model="form.log_backup_count" aria-label="历史日志保留份数" :min="1" :max="100" :precision="0" :step="1" controls-position="right" />
+              <span>份</span>
+            </div>
+          </div>
+        </div>
+        <div class="quality-note log-budget">预计总占用约 {{ logBudgetText }}，默认约 25 MiB。保存后生效；调小份数会清理更旧的日志，已有大文件随轮换逐步替换。</div>
+        <div v-if="logInfo" class="log-directory">{{ logInfo.directory }}</div>
+        <el-button @click="openLogFolder" :loading="openingLogs" :disabled="loadingLogs">打开日志文件夹</el-button>
+        <div class="quality-note">包含录制和自动监控记录。遇到问题时，可将文件夹中的日志文件提供给开发者。</div>
+        <div v-if="logInfo?.last_error" class="log-error" role="alert">最近一次保存失败（部分日志可能缺失）：{{ logInfo.last_error }}</div>
+        <div v-if="logInfoError" class="log-error" role="alert">{{ logInfoError }}</div>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header">
           <span class="section-label">数据库位置</span>
           <span class="section-hint">迁移完成后立即生效，原数据库保留</span>
         </div>
@@ -222,8 +254,10 @@ import { computed, ref, reactive } from 'vue'
 import { useRecorderStore } from '../stores/recorder'
 import { DEFAULT_QUALITY, QUALITY_OPTIONS, normalizeQuality } from '../constants/quality'
 import { getVersion } from '@tauri-apps/api/app'
+import { invoke } from '@tauri-apps/api/core'
+import { openPath } from '@tauri-apps/plugin-opener'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { AppSettings } from '../types'
+import type { AppSettings, RecordingLogInfo } from '../types'
 
 const visible = defineModel<boolean>({ default: false })
 const store = useRecorderStore()
@@ -234,6 +268,38 @@ const hasRunningTasks = computed(() => store.tasks.some(task =>
   task.status === 'recording' || task.status === 'finalizing' || task.segments?.some(segment => ['queued', 'converting'].includes(segment.conversion_state))
 ))
 const version = ref('')
+const logInfo = ref<RecordingLogInfo | null>(null)
+const logInfoError = ref('')
+const loadingLogs = ref(false)
+const openingLogs = ref(false)
+
+async function refreshLogInfo(): Promise<RecordingLogInfo | null> {
+  loadingLogs.value = true
+  logInfoError.value = ''
+  try {
+    logInfo.value = await invoke<RecordingLogInfo>('get_recording_log_info')
+    return logInfo.value
+  } catch (error) {
+    logInfo.value = null
+    logInfoError.value = `无法读取日志信息：${error}`
+    return null
+  } finally {
+    loadingLogs.value = false
+  }
+}
+
+async function openLogFolder() {
+  if (openingLogs.value) return
+  openingLogs.value = true
+  try {
+    const info = await refreshLogInfo()
+    if (info) await openPath(info.directory)
+  } catch (error) {
+    logInfoError.value = `无法打开日志文件夹：${error}`
+  } finally {
+    openingLogs.value = false
+  }
+}
 
 getVersion().then(v => { version.value = v })
 
@@ -252,9 +318,20 @@ const form = reactive({
   auto_monitor_window_hours: 6,
   auto_disable_after_record: true,
   notify_updates: true,
+  log_max_size_mib: 5,
+  log_backup_count: 4,
+})
+
+const logBudgetText = computed(() => {
+  const size = form.log_max_size_mib
+  const count = form.log_backup_count
+  if (!Number.isInteger(size) || size < 1 || !Number.isInteger(count) || count < 1) return '—'
+  const total = size * (count + 1)
+  return total >= 1024 ? `${(total / 1024).toFixed(2)} GiB` : `${total} MiB`
 })
 
 function onOpen() {
+  void refreshLogInfo()
   form.close_behavior = store.settings.close_behavior ?? 'exit'
   form.proxy = store.settings.proxy
   form.cookie = store.settings.cookie
@@ -270,6 +347,8 @@ function onOpen() {
   form.auto_monitor_window_hours = store.settings.auto_monitor_window_hours ?? 6
   form.auto_disable_after_record = store.settings.auto_disable_after_record ?? true
   form.notify_updates = store.settings.notify_updates ?? true
+  form.log_max_size_mib = store.settings.log_max_size_mib ?? 5
+  form.log_backup_count = store.settings.log_backup_count ?? 4
 }
 
 async function onMigrate() {
@@ -300,6 +379,14 @@ async function onSave() {
     ElMessage.error('分段时长必须为正整数分钟')
     return
   }
+  if (!Number.isInteger(form.log_max_size_mib) || form.log_max_size_mib < 1 || form.log_max_size_mib > 1024) {
+    ElMessage.error('单个日志大小必须是 1 到 1024 MiB 的整数')
+    return
+  }
+  if (!Number.isInteger(form.log_backup_count) || form.log_backup_count < 1 || form.log_backup_count > 100) {
+    ElMessage.error('历史日志保留份数必须是 1 到 100 的整数')
+    return
+  }
   saving.value = true
   try {
     await store.saveSettings({ ...form, db_path: store.settings.db_path })
@@ -314,6 +401,24 @@ async function onSave() {
 </script>
 
 <style scoped>
+.log-budget {
+  margin-bottom: 10px;
+}
+
+.log-directory {
+  margin-bottom: 8px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  color: var(--color-text-secondary);
+}
+
+.log-error {
+  margin-top: 8px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  color: var(--color-warning);
+}
+
 .settings-body {
   padding: 4px 0;
   max-height: 66vh;

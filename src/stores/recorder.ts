@@ -43,6 +43,8 @@ export const useRecorderStore = defineStore('recorder', () => {
     auto_monitor_window_hours: 6,
     auto_disable_after_record: true,
     notify_updates: true,
+    log_max_size_mib: 5,
+    log_backup_count: 4,
   })
   let unlistenRecordingStatus: UnlistenFn | null = null
   let unlistenSegments: UnlistenFn | null = null

@@ -7,6 +7,7 @@ mod lifecycle;
 mod migration;
 mod parser;
 mod recorder;
+mod recording_log;
 mod segment_runtime;
 mod segment_store;
 #[cfg(all(test, windows))]
@@ -25,6 +26,7 @@ use database::{Database, LiveRoom, RecordTask};
 use parser::{DouyinParser, LiveInfo};
 use recorder::{Recorder, RecordingExit};
 use serde::Serialize;
+use serde_json::json;
 use settings::AppSettings;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::Duration;
@@ -153,6 +155,18 @@ fn emit_recording_event(
     reason: &str,
     message: Option<String>,
 ) {
+    recording_log::event(
+        if matches!(reason, "failed" | "interrupted") {
+            "WARN"
+        } else {
+            "INFO"
+        },
+        "recording_status",
+        Some(task.id),
+        Some(task.room_id),
+        json!({"reason": reason, "status": task.status, "trigger": task.trigger,
+            "file_path": task.file_path, "file_size": task.file_size, "message": message}),
+    );
     let _ = app.emit(
         "recording-status-changed",
         RecordingStatusChanged {
@@ -170,6 +184,20 @@ fn emit_auto_recording_event(
     reason: &str,
     message: Option<String>,
 ) {
+    // Quiet offline polls emit enabled/None too; only meaningful changes are logged here.
+    if message.is_some() {
+        recording_log::event(
+            if matches!(reason, "paused" | "backoff") {
+                "WARN"
+            } else {
+                "INFO"
+            },
+            "auto_monitor_changed",
+            None,
+            Some(room.id),
+            recording_log::automation_details(&room, reason, message.as_deref()),
+        );
+    }
     let _ = app.emit(
         "room-auto-recording-changed",
         RoomAutoRecordingChanged {
@@ -343,30 +371,6 @@ async fn handle_recording_exit(
     };
     let segmented = finalizing_task.segment_output.is_some();
     emit_recording_event(&app, finalizing_task, None, "finalizing", None);
-    #[cfg(debug_assertions)]
-    {
-        let reason = if exit.forced_stop_reason.is_some() {
-            "manual_stop_forced"
-        } else if exit.manually_stopped && exit.stopped_cleanly() {
-            "manual_stop"
-        } else if exit.manually_stopped {
-            "manual_stop_failed"
-        } else if !exit.stopped_cleanly() {
-            "process_error"
-        } else {
-            "stream_exit"
-        };
-        eprintln!(
-            "ffmpeg task {} exited (reason: {}, success: {}, exit_code: {:?}, forced_stop: {:?}, wait_error: {:?}, stderr_lines: {})",
-            task_id,
-            reason,
-            exit.status_success,
-            exit.exit_code,
-            exit.forced_stop_reason,
-            exit.wait_error,
-            exit.stderr_tail.len()
-        );
-    }
     let mut rate_limited = false;
     let (verification, verification_message) = if exit.manually_stopped {
         (None, None)
@@ -382,6 +386,19 @@ async fn handle_recording_exit(
             .await;
         match result {
             Ok(info) => {
+                if let Some(logger) = recording_log::logger() {
+                    logger.live_verification(
+                        task_id,
+                        room_id,
+                        Some(if info.is_live {
+                            LiveVerification::Live
+                        } else {
+                            LiveVerification::Offline
+                        }),
+                        false,
+                        None,
+                    );
+                }
                 apply_live_info(&state, room_id, &info)?;
                 if info.is_live {
                     (
@@ -394,6 +411,15 @@ async fn handle_recording_exit(
             }
             Err(error) => {
                 rate_limited = error.is_rate_limited();
+                if let Some(logger) = recording_log::logger() {
+                    logger.live_verification(
+                        task_id,
+                        room_id,
+                        Some(LiveVerification::Failed),
+                        rate_limited,
+                        Some(error.to_string()),
+                    );
+                }
                 (
                     Some(LiveVerification::Failed),
                     Some(format!("录制进程已结束，但无法确认直播状态: {}", error)),
@@ -401,7 +427,19 @@ async fn handle_recording_exit(
             }
         }
     };
+    if exit.manually_stopped {
+        if let Some(logger) = recording_log::logger() {
+            logger.live_verification(task_id, room_id, None, false, None);
+        }
+    }
     let status = classify_recording(original_size, &exit, verification);
+    recording_log::event(
+        "INFO",
+        "recording_classified",
+        Some(task_id),
+        Some(room_id),
+        json!({"status": status, "file_size": original_size, "message": verification_message}),
+    );
     let mut final_path = original_path.clone();
     let mut final_size = original_size;
     let mut message = match status {
@@ -475,6 +513,13 @@ async fn handle_recording_exit(
             }
         }
     }
+    recording_log::event(
+        "INFO",
+        "recording_auto_policy",
+        Some(task_id),
+        Some(room_id),
+        recording_log::automation_details(&room, auto_reason, auto_message.as_deref()),
+    );
     emit_auto_recording_event(&app, room.clone(), auto_reason, auto_message);
     let reason = match status {
         "completed" if exit.manually_stopped => "manual_stop",
@@ -505,6 +550,35 @@ impl std::fmt::Display for StartRecordError {
 }
 
 async fn start_record_from_info(
+    app: &AppHandle,
+    state: &AppState,
+    room_id: i64,
+    info: &LiveInfo,
+    trigger: &str,
+    expected_revision: Option<i64>,
+) -> Result<RecordTask, StartRecordError> {
+    let result =
+        start_record_from_info_inner(app, state, room_id, info, trigger, expected_revision).await;
+    if let Err(error) = &result {
+        recording_log::event(
+            if matches!(
+                error,
+                StartRecordError::Superseded | StartRecordError::AlreadyRunning
+            ) {
+                "INFO"
+            } else {
+                "ERROR"
+            },
+            "recording_start_rejected",
+            None,
+            Some(room_id),
+            json!({"trigger": trigger, "error": error.to_string()}),
+        );
+    }
+    result
+}
+
+async fn start_record_from_info_inner(
     app: &AppHandle,
     state: &AppState,
     room_id: i64,
@@ -565,6 +639,15 @@ async fn start_record_from_info(
                 .to_string_lossy()
                 .into_owned()
         });
+    recording_log::event(
+        "INFO",
+        "recording_start_requested",
+        Some(task_id),
+        Some(room_id),
+        json!({"platform_room_id": room.room_id, "trigger": trigger, "mode": room.auto_monitor_mode,
+            "quality": app_settings.quality, "segmented": segment_output.is_some(),
+            "segment_duration_minutes": app_settings.segment_duration_minutes, "output_path": output_str}),
+    );
     db.update_task_status_and_path(
         task_id,
         "recording",
@@ -659,6 +742,13 @@ async fn start_record_from_info(
         result
     })();
     if let Err(error) = start_result {
+        recording_log::event(
+            "ERROR",
+            "recording_start_failed",
+            Some(task_id),
+            Some(room_id),
+            json!({"error": error}),
+        );
         for segment in db.get_segments(task_id).map_err(fatal)? {
             db.close_segment(
                 segment.id,
@@ -687,6 +777,13 @@ async fn start_record_from_info(
         );
         return Err(StartRecordError::Fatal(error));
     }
+    recording_log::event(
+        "INFO",
+        "recording_started",
+        Some(task_id),
+        Some(room_id),
+        json!({"trigger": trigger}),
+    );
     state.auto_recorder.mark_recording_started(room_id);
     room.auto_record_error = None;
     room.auto_record_retry_at = None;
@@ -713,6 +810,13 @@ fn handle_check_error(
     rate_limited: bool,
     fatal: bool,
 ) -> Result<(), String> {
+    recording_log::event(
+        "WARN",
+        "auto_check_error",
+        None,
+        Some(snapshot.id),
+        json!({"error": message, "fatal": fatal, "rate_limited": rate_limited}),
+    );
     let state = app.state::<AppState>();
     if state.lifecycle.is_exiting() {
         return Ok(());
@@ -789,6 +893,15 @@ async fn check_auto_room(app: &AppHandle, snapshot: LiveRoom) -> Result<(), Stri
         }
         let mut room = apply_live_info_in_db(&db, room.id, &info)?;
         if !info.is_live {
+            if room.auto_record_error.is_some() {
+                recording_log::event(
+                    "INFO",
+                    "auto_check_recovered",
+                    None,
+                    Some(room.id),
+                    json!({"result": "offline"}),
+                );
+            }
             state
                 .auto_recorder
                 .mark_success(room.id, settings.auto_check_interval_secs);
@@ -878,27 +991,42 @@ fn next_due_auto_room(app: &AppHandle) -> Result<Option<LiveRoom>, String> {
 async fn auto_record_loop(app: AppHandle) {
     loop {
         if let Err(error) = process_auto_deadlines_and_schedules(&app) {
-            #[cfg(debug_assertions)]
-            eprintln!("auto recorder schedule tick failed: {}", error);
+            recording_log::event(
+                "ERROR",
+                "auto_schedule_failed",
+                None,
+                None,
+                json!({"error": error}),
+            );
         }
         match next_due_auto_room(&app) {
             Ok(Some(room)) => {
                 let room_id = room.id;
                 if let Err(error) = check_auto_room(&app, room).await {
                     let state = app.state::<AppState>();
-                    state.auto_recorder.mark_failure(
+                    let delay = state.auto_recorder.mark_failure(
                         room_id,
                         settings::load_settings().auto_check_interval_secs,
                         false,
                     );
-                    #[cfg(debug_assertions)]
-                    eprintln!("auto recorder room check failed: {}", error);
+                    recording_log::event(
+                        "ERROR",
+                        "auto_check_failed",
+                        None,
+                        Some(room_id),
+                        json!({"error": error, "retry_at": (Utc::now() + ChronoDuration::seconds(delay as i64)).to_rfc3339()}),
+                    );
                 }
             }
             Ok(None) => {}
             Err(error) => {
-                #[cfg(debug_assertions)]
-                eprintln!("auto recorder selection failed: {}", error);
+                recording_log::event(
+                    "ERROR",
+                    "auto_selection_failed",
+                    None,
+                    None,
+                    json!({"error": error}),
+                );
             }
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1136,7 +1264,11 @@ async fn start_record(
         .parser
         .parse_douyin_url(&douyin_url, &app_settings)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| {
+            recording_log::event("ERROR", "recording_start_failed", None, Some(room_id),
+                json!({"trigger": "manual", "stage": "live_check", "error": error.to_string(), "rate_limited": error.is_rate_limited()}));
+            error.to_string()
+        })?;
     apply_live_info(&state, room_id, &info)?;
     state.lifecycle.ensure_running()?;
     if !info.is_live {
@@ -1144,6 +1276,13 @@ async fn start_record(
         let task_id = db.add_task(room_id, "manual").map_err(|e| e.to_string())?;
         db.update_task_status(task_id, "waiting")
             .map_err(|e| e.to_string())?;
+        recording_log::event(
+            "INFO",
+            "recording_not_live",
+            Some(task_id),
+            Some(room_id),
+            json!({"trigger": "manual"}),
+        );
         return Err("主播未开播，任务已创建但未开始录制".to_string());
     }
     start_record_from_info(&app, &state, room_id, &info, "manual", None)
@@ -1183,6 +1322,13 @@ async fn stop_record(
         let _start_guard = state.start_lock.lock().await;
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let task = db.get_task(task_id).map_err(|e| e.to_string())?;
+        recording_log::event(
+            "INFO",
+            "recording_stop_requested",
+            Some(task_id),
+            Some(task.room_id),
+            json!({"status": task.status}),
+        );
         let mut room = db.get_room(task.room_id).map_err(|e| e.to_string())?;
         if auto_policy::disable_for_manual_stop(&mut room, &task.status, Utc::now()) {
             let room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
@@ -1202,6 +1348,13 @@ async fn stop_record(
             db.get_task(task_id).map_err(|e| e.to_string())?
         };
         if task.status == "recording" {
+            recording_log::event(
+                "ERROR",
+                "recording_process_missing",
+                Some(task_id),
+                Some(task.room_id),
+                json!({"error": "未找到对应的 FFmpeg 进程"}),
+            );
             handle_recording_exit(
                 app,
                 task_id,
@@ -1335,6 +1488,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            recording_log::initialize();
             let db = Database::new(&settings::get_db_path())?;
             db.reconcile_incomplete_tasks()?;
             let app_settings = settings::load_settings();
@@ -1385,6 +1539,7 @@ pub fn run() {
             migrate_db_cmd,
             check_for_update,
             desktop::get_lifecycle_status,
+            recording_log::get_recording_log_info,
         ])
         .build(tauri::generate_context!())
         .expect("应用启动失败")

@@ -3,6 +3,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_QUALITY: &str = "ORIGIN";
+pub const DEFAULT_LOG_MAX_SIZE_MIB: u64 = 5;
+pub const DEFAULT_LOG_BACKUP_COUNT: usize = 4;
+pub const MAX_LOG_SIZE_MIB: u64 = 1024;
+pub const MAX_LOG_BACKUP_COUNT: usize = 100;
 
 pub fn normalize_quality(quality: &str) -> &str {
     match quality.trim() {
@@ -46,6 +50,8 @@ pub struct AppSettings {
     pub auto_disable_after_record: bool,
     pub notify_updates: bool,
     pub close_behavior: CloseBehavior,
+    pub log_max_size_mib: u64,
+    pub log_backup_count: usize,
 }
 
 impl Default for AppSettings {
@@ -78,6 +84,8 @@ impl Default for AppSettings {
             auto_disable_after_record: true,
             notify_updates: true,
             close_behavior: CloseBehavior::Exit,
+            log_max_size_mib: DEFAULT_LOG_MAX_SIZE_MIB,
+            log_backup_count: DEFAULT_LOG_BACKUP_COUNT,
         }
     }
 }
@@ -119,6 +127,16 @@ pub fn load_settings_from(path: &Path) -> Result<AppSettings, String> {
 }
 
 pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), String> {
+    if !(1..=MAX_LOG_SIZE_MIB).contains(&settings.log_max_size_mib) {
+        return Err(format!(
+            "单个日志大小必须在 1 到 {MAX_LOG_SIZE_MIB} MiB 之间"
+        ));
+    }
+    if !(1..=MAX_LOG_BACKUP_COUNT).contains(&settings.log_backup_count) {
+        return Err(format!(
+            "历史日志保留份数必须在 1 到 {MAX_LOG_BACKUP_COUNT} 之间"
+        ));
+    }
     if settings.segment_duration_minutes == 0 {
         return Err("分段时长必须为正整数分钟".to_string());
     }
@@ -153,6 +171,30 @@ pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::{load_settings_from, save_settings_at, AppSettings};
+
+    #[test]
+    fn log_settings_default_roundtrip_and_invalid_saves_preserve_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"quality":"HD1"}"#).unwrap();
+        let mut settings = load_settings_from(&path).unwrap();
+        assert_eq!(settings.log_max_size_mib, 5);
+        assert_eq!(settings.log_backup_count, 4);
+        settings.log_max_size_mib = 50;
+        settings.log_backup_count = 10;
+        save_settings_at(&settings, &path).unwrap();
+        let loaded = load_settings_from(&path).unwrap();
+        assert_eq!(loaded.log_max_size_mib, 50);
+        assert_eq!(loaded.log_backup_count, 10);
+        assert_eq!(loaded.quality, "HD1");
+        let original = std::fs::read(&path).unwrap();
+        for (size, count) in [(0, 4), (1025, 4), (5, 0), (5, 101)] {
+            settings.log_max_size_mib = size;
+            settings.log_backup_count = count;
+            assert!(save_settings_at(&settings, &path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
 
     #[test]
     fn segment_settings_upgrade_roundtrip_and_reject_zero_without_overwriting() {

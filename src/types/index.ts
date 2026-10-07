@@ -63,12 +63,19 @@ export interface AppSettings {
   auto_monitor_window_hours: number
   auto_disable_after_record: boolean
   notify_updates: boolean
+  log_max_size_mib: number
+  log_backup_count: number
 }
 
 export interface LifecycleStatus {
   exiting: boolean
   revision: number
   message: string | null
+}
+
+export interface RecordingLogInfo {
+  directory: string
+  last_error: string | null
 }
 
 export interface UpdateInfo {

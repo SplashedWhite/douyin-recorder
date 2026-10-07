@@ -4,7 +4,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, watch};
 
@@ -119,6 +119,7 @@ impl Completion {
 pub struct Recorder {
     active_records: Arc<Mutex<HashMap<i64, ActiveRecording>>>,
     ffmpeg_path: String,
+    logger: Option<Arc<crate::recording_log::RecordingLogger>>,
 }
 
 impl Recorder {
@@ -126,6 +127,7 @@ impl Recorder {
         Recorder {
             active_records: Arc::new(Mutex::new(HashMap::new())),
             ffmpeg_path,
+            logger: crate::recording_log::logger(),
         }
     }
 
@@ -226,21 +228,10 @@ impl Recorder {
         // so a later stop request can still ask FFmpeg to finalize its output.
         let stdin = child.stdin.take();
 
-        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
-        let stderr_task = child.stderr.take().map(|stderr| {
-            let stderr_tail = Arc::clone(&stderr_tail);
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Ok(mut tail) = stderr_tail.lock() {
-                        if tail.len() == STDERR_TAIL_LINES {
-                            tail.pop_front();
-                        }
-                        tail.push_back(line);
-                    }
-                }
-            })
-        });
+        let stderr_task = child
+            .stderr
+            .take()
+            .map(|stderr| tokio::spawn(read_stderr_tail(stderr)));
 
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (completion_tx, completion_rx) = watch::channel(None);
@@ -258,6 +249,7 @@ impl Recorder {
         }
 
         let active_records = Arc::clone(&self.active_records);
+        let logger = self.logger.clone();
         tokio::spawn(async move {
             let mut exit = tokio::select! {
                 result = child.wait() => RecordingExit::from_status(result, false),
@@ -265,15 +257,12 @@ impl Recorder {
             };
 
             if let Some(stderr_task) = stderr_task {
-                let _ = stderr_task.await;
+                exit.stderr_tail = stderr_task
+                    .await
+                    .unwrap_or_else(|error| vec![format!("读取 FFmpeg 错误输出失败: {error}")]);
             }
 
-            exit.stderr_tail = stderr_tail
-                .lock()
-                .map(|tail| tail.iter().cloned().collect())
-                .unwrap_or_default();
-
-            let result = on_exit(exit).await;
+            let result = finish_recording(logger.as_deref(), task_id, exit, on_exit).await;
 
             if let Ok(mut records) = active_records.lock() {
                 records.remove(&task_id);
@@ -358,6 +347,61 @@ impl Recorder {
     }
 }
 
+async fn read_stderr_tail(reader: impl AsyncRead + Unpin) -> Vec<String> {
+    let mut reader = BufReader::new(reader);
+    let mut tail = VecDeque::with_capacity(STDERR_TAIL_LINES);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        let (line, failed) = match reader.read_until(b'\n', &mut bytes).await {
+            Ok(0) => break,
+            // FFmpeg on Windows may emit non-UTF-8 text. Keep collecting later lines.
+            Ok(_) => (
+                String::from_utf8_lossy(&bytes)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string(),
+                false,
+            ),
+            Err(error) => (format!("读取 FFmpeg 错误输出失败: {error}"), true),
+        };
+        if tail.len() == STDERR_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+        if failed {
+            break;
+        }
+    }
+    tail.into_iter().collect()
+}
+
+async fn finish_recording<F, Fut>(
+    logger: Option<&crate::recording_log::RecordingLogger>,
+    task_id: i64,
+    exit: RecordingExit,
+    on_exit: F,
+) -> Result<(), String>
+where
+    F: FnOnce(RecordingExit) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    // Persist evidence before any DB access, live verification, segment work or remux.
+    if let Some(logger) = logger {
+        logger.process_exit(task_id, &exit);
+    }
+    let result = on_exit(exit).await;
+    if let (Some(logger), Err(error)) = (logger, &result) {
+        logger.write(
+            "ERROR",
+            "recording_finalize_failed",
+            Some(task_id),
+            None,
+            serde_json::json!({"error": error}),
+        );
+    }
+    result
+}
+
 impl Drop for Recorder {
     fn drop(&mut self) {
         if let Ok(mut records) = self.active_records.lock() {
@@ -385,6 +429,118 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("binaries")
             .join("ffmpeg-x86_64-pc-windows-msvc.exe")
+    }
+
+    fn logged_records(dir: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.join("recorder.log"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn last_fifty_lines_are_saved_before_a_failing_finalizer() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = crate::recording_log::RecordingLogger::new(dir.path().into());
+        let mut input = b"invalid utf8 \xff\n".to_vec();
+        for index in 0..60 {
+            input.extend_from_slice(format!("错误 {index}\r\n").as_bytes());
+        }
+        let tail = super::read_stderr_tail(input.as_slice()).await;
+        assert_eq!(tail.len(), 50);
+        assert_eq!(tail.first().unwrap(), "错误 10");
+        assert_eq!(tail.last().unwrap(), "错误 59");
+        let exit = super::RecordingExit {
+            manually_stopped: false,
+            status_success: false,
+            exit_code: Some(1),
+            forced_stop_reason: None,
+            wait_error: None,
+            stderr_tail: tail,
+        };
+        let result = super::finish_recording(Some(&logger), 77, exit, |_| async {
+            let records = logged_records(dir.path());
+            assert_eq!(
+                records.len(),
+                1,
+                "process exit must be flushed before finalization"
+            );
+            assert_eq!(
+                records[0]["details"]["stderr_tail"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                50
+            );
+            assert_eq!(records[0]["details"]["reason"], "process_error");
+            Err("数据库保存失败".into())
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "数据库保存失败");
+        let records = logged_records(dir.path());
+        assert_eq!(records[1]["event"], "recording_finalize_failed");
+        assert_eq!(records[1]["details"]["error"], "数据库保存失败");
+    }
+
+    #[tokio::test]
+    async fn unavailable_logs_do_not_change_finalization_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "file").unwrap();
+        let logger = crate::recording_log::RecordingLogger::new(blocked);
+        let exit = super::RecordingExit {
+            manually_stopped: true,
+            status_success: true,
+            exit_code: Some(0),
+            forced_stop_reason: None,
+            wait_error: None,
+            stderr_tail: vec![],
+        };
+        let called = std::sync::atomic::AtomicBool::new(false);
+        super::finish_recording(Some(&logger), 78, exit, |exit| {
+            assert!(exit.stopped_cleanly());
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(logger.info().last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn real_ffmpeg_failure_is_logged_before_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let mut recorder = Recorder::new(bundled_ffmpeg().to_string_lossy().into_owned());
+        recorder.logger = Some(std::sync::Arc::new(
+            crate::recording_log::RecordingLogger::new(logs.clone()),
+        ));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        recorder
+            .start_record(
+                79,
+                dir.path().join("missing.flv").to_str().unwrap(),
+                dir.path().join("output.flv").to_str().unwrap(),
+                "",
+                move |exit| async move {
+                    assert!(!exit.status_success);
+                    let records = logged_records(&logs);
+                    assert_eq!(records[0]["event"], "recording_process_exit");
+                    assert!(!records[0]["details"]["stderr_tail"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty());
+                    let _ = tx.send(());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -557,7 +713,11 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
         });
-        let recorder = Recorder::new(ffmpeg.to_string_lossy().to_string());
+        let mut recorder = Recorder::new(ffmpeg.to_string_lossy().to_string());
+        let logs = dir.path().join("logs");
+        recorder.logger = Some(std::sync::Arc::new(
+            crate::recording_log::RecordingLogger::new(logs.clone()),
+        ));
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         recorder
             .start_record(
@@ -594,6 +754,9 @@ mod tests {
         assert!(exit.stopped_cleanly(), "{exit:?}");
         assert_eq!(exit.exit_code, Some(0));
         assert!(!recorder.is_active(74));
+        let records = logged_records(&logs);
+        assert_eq!(records[0]["details"]["reason"], "manual_stop");
+        assert_eq!(records[0]["details"]["exit_code"], 0);
         server.abort();
         let _ = server.await;
 

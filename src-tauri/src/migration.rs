@@ -39,6 +39,8 @@ pub fn save_settings(
     let db = state.db.lock().map_err(|e| e.to_string())?;
     new_settings.db_path = db.path().to_string_lossy().to_string();
     settings::save_settings_at(&new_settings, settings_path)?;
+    // Apply under the same lock as persistence so concurrent saves cannot restore older limits.
+    crate::recording_log::configure(&new_settings);
     Ok(new_settings)
 }
 
