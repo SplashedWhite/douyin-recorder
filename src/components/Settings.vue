@@ -203,11 +203,42 @@
             </div>
           </div>
         </div>
-        <div class="quality-note log-budget">预计总占用约 {{ logBudgetText }}，默认约 25 MiB。保存后生效；调小份数会清理更旧的日志，已有大文件随轮换逐步替换。</div>
+        <div class="quality-note log-budget">录制日志 recorder.log：预计占用约 {{ logBudgetText }}，默认约 25 MiB。保存后生效；调小份数会在后续写入时清理更旧的日志，已有大文件随轮换逐步替换。</div>
+        <div class="auto-settings-panel log-retention">
+          <div class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">记录接口响应</div>
+              <div class="auto-setting-hint">观察直播中和下播后的响应变化</div>
+            </div>
+            <el-switch v-model="form.api_log_enabled" aria-label="记录接口响应" />
+          </div>
+          <template v-if="form.api_log_enabled">
+            <div class="auto-setting-row">
+              <span class="auto-setting-label">单个接口日志大小</span>
+              <div class="number-setting">
+                <el-input-number v-model="form.api_log_max_size_mib" aria-label="单个接口日志大小" :min="1" :max="1024" :precision="0" :step="1" controls-position="right" />
+                <span>MiB</span>
+              </div>
+            </div>
+            <div class="auto-setting-row">
+              <div>
+                <div class="auto-setting-label">接口日志历史保留份数</div>
+                <div class="auto-setting-hint">不含当前正在写入的文件，与录制日志分别保留</div>
+              </div>
+              <div class="number-setting">
+                <el-input-number v-model="form.api_log_backup_count" aria-label="接口日志历史保留份数" :min="1" :max="100" :precision="0" :step="1" controls-position="right" />
+                <span>份</span>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="quality-note log-budget">接口响应保存至 douyin-api.log，成功和失败都会记录，凭证会隐藏。保存设置后生效，不增加请求；关闭后保留已有文件。</div>
+        <div v-if="form.api_log_enabled" class="quality-note log-budget">接口日志预计占用约 {{ apiLogBudgetText }}，默认约 25 MiB。调小份数会在后续写入时清理旧文件；单条完整响应可能超过大小阈值。</div>
         <div v-if="logInfo" class="log-directory">{{ logInfo.directory }}</div>
         <el-button @click="openLogFolder" :loading="openingLogs" :disabled="loadingLogs">打开日志文件夹</el-button>
         <div class="quality-note">包含录制和自动监控记录。遇到问题时，可将文件夹中的日志文件提供给开发者。</div>
-        <div v-if="logInfo?.last_error" class="log-error" role="alert">最近一次保存失败（部分日志可能缺失）：{{ logInfo.last_error }}</div>
+        <div v-if="logInfo?.last_error" class="log-error" role="alert">录制日志最近一次保存失败（部分记录可能缺失）：{{ logInfo.last_error }}</div>
+        <div v-if="logInfo?.api_last_error" class="log-error" role="alert">接口日志最近一次保存失败（部分响应可能缺失）：{{ logInfo.api_last_error }}</div>
         <div v-if="logInfoError" class="log-error" role="alert">{{ logInfoError }}</div>
       </div>
 
@@ -320,15 +351,19 @@ const form = reactive({
   notify_updates: true,
   log_max_size_mib: 5,
   log_backup_count: 4,
+  api_log_enabled: false,
+  api_log_max_size_mib: 5,
+  api_log_backup_count: 4,
 })
 
-const logBudgetText = computed(() => {
-  const size = form.log_max_size_mib
-  const count = form.log_backup_count
+function formatLogBudget(size: number, count: number): string {
   if (!Number.isInteger(size) || size < 1 || !Number.isInteger(count) || count < 1) return '—'
   const total = size * (count + 1)
   return total >= 1024 ? `${(total / 1024).toFixed(2)} GiB` : `${total} MiB`
-})
+}
+
+const logBudgetText = computed(() => formatLogBudget(form.log_max_size_mib, form.log_backup_count))
+const apiLogBudgetText = computed(() => formatLogBudget(form.api_log_max_size_mib, form.api_log_backup_count))
 
 function onOpen() {
   void refreshLogInfo()
@@ -349,6 +384,9 @@ function onOpen() {
   form.notify_updates = store.settings.notify_updates ?? true
   form.log_max_size_mib = store.settings.log_max_size_mib ?? 5
   form.log_backup_count = store.settings.log_backup_count ?? 4
+  form.api_log_enabled = store.settings.api_log_enabled ?? false
+  form.api_log_max_size_mib = store.settings.api_log_max_size_mib ?? 5
+  form.api_log_backup_count = store.settings.api_log_backup_count ?? 4
 }
 
 async function onMigrate() {
@@ -385,6 +423,14 @@ async function onSave() {
   }
   if (!Number.isInteger(form.log_backup_count) || form.log_backup_count < 1 || form.log_backup_count > 100) {
     ElMessage.error('历史日志保留份数必须是 1 到 100 的整数')
+    return
+  }
+  if (!Number.isInteger(form.api_log_max_size_mib) || form.api_log_max_size_mib < 1 || form.api_log_max_size_mib > 1024) {
+    ElMessage.error('单个接口日志大小必须是 1 到 1024 MiB 的整数')
+    return
+  }
+  if (!Number.isInteger(form.api_log_backup_count) || form.api_log_backup_count < 1 || form.api_log_backup_count > 100) {
+    ElMessage.error('接口日志历史保留份数必须是 1 到 100 的整数')
     return
   }
   saving.value = true

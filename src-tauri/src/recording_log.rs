@@ -15,26 +15,37 @@ static LOGGER: OnceLock<Arc<RecordingLogger>> = OnceLock::new();
 pub struct RecordingLogInfo {
     pub directory: String,
     pub last_error: Option<String>,
+    pub api_last_error: Option<String>,
 }
 
 pub struct RecordingLogger {
+    recording: RotatingLog,
+    api: RotatingLog,
+}
+
+// Both logs share file management, but never share limits, locks or archive names.
+struct RotatingLog {
     directory: PathBuf,
+    stem: &'static str,
     // Serializes records, configuration changes and rotation independently of the DB.
     state: Mutex<LogState>,
 }
 
 struct LogState {
+    enabled: bool,
     max_file_bytes: u64,
     backup_count: usize,
     prune_pending: bool,
     last_error: Option<String>,
 }
 
-impl RecordingLogger {
-    pub fn new(directory: PathBuf) -> Self {
+impl RotatingLog {
+    fn new(directory: PathBuf, stem: &'static str, enabled: bool) -> Self {
         Self {
             directory,
+            stem,
             state: Mutex::new(LogState {
+                enabled,
                 max_file_bytes: crate::settings::DEFAULT_LOG_MAX_SIZE_MIB * MIB,
                 backup_count: crate::settings::DEFAULT_LOG_BACKUP_COUNT,
                 prune_pending: true,
@@ -43,22 +54,25 @@ impl RecordingLogger {
         }
     }
 
-    pub fn info(&self) -> RecordingLogInfo {
-        RecordingLogInfo {
-            directory: self.directory.to_string_lossy().into_owned(),
-            last_error: self
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .last_error
-                .clone(),
-        }
+    fn last_error(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_error
+            .clone()
     }
 
-    fn set_limits(&self, max_file_bytes: u64, backup_count: usize) -> bool {
+    fn enabled(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).enabled
+    }
+
+    fn configure(&self, enabled: bool, max_file_bytes: u64, backup_count: usize) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let changed = state.max_file_bytes != max_file_bytes || state.backup_count != backup_count;
+        let changed = state.enabled != enabled
+            || state.max_file_bytes != max_file_bytes
+            || state.backup_count != backup_count;
         if changed {
+            state.enabled = enabled;
             state.max_file_bytes = max_file_bytes;
             state.backup_count = backup_count;
             state.prune_pending = true;
@@ -66,46 +80,14 @@ impl RecordingLogger {
         changed
     }
 
-    fn apply_settings(&self, settings: &crate::settings::AppSettings) {
-        // Invalid hand-edited limits fall back independently, without losing other settings.
-        let size = if (1..=crate::settings::MAX_LOG_SIZE_MIB).contains(&settings.log_max_size_mib) {
-            settings.log_max_size_mib
-        } else {
-            crate::settings::DEFAULT_LOG_MAX_SIZE_MIB
-        };
-        let count =
-            if (1..=crate::settings::MAX_LOG_BACKUP_COUNT).contains(&settings.log_backup_count) {
-                settings.log_backup_count
-            } else {
-                crate::settings::DEFAULT_LOG_BACKUP_COUNT
-            };
-        if self.set_limits(size * MIB, count) {
-            self.write(
-                "INFO",
-                "logging_configured",
-                None,
-                None,
-                json!({"max_size_mib": size, "backup_count": count}),
-            );
-        }
-    }
-
-    pub fn write(
-        &self,
-        level: &str,
-        event: &str,
-        task_id: Option<i64>,
-        room_id: Option<i64>,
-        mut details: Value,
-    ) {
-        sanitize_value(&mut details);
-        let record = json!({
-            "timestamp": Local::now().to_rfc3339(), "level": level, "event": event,
-            "task_id": task_id, "room_id": room_id, "details": details,
-        });
+    fn write(&self, record: &Value) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Recheck under the write lock so disabling also stops requests already in flight.
+        if !state.enabled {
+            return;
+        }
         let result = (|| -> io::Result<()> {
-            let mut bytes = serde_json::to_vec(&record)?;
+            let mut bytes = serde_json::to_vec(record)?;
             bytes.push(b'\n');
             fs::create_dir_all(&self.directory)?;
             if state.prune_pending {
@@ -137,9 +119,9 @@ impl RecordingLogger {
 
     fn path(&self, index: usize) -> PathBuf {
         self.directory.join(if index == 0 {
-            "recorder.log".into()
+            format!("{}.log", self.stem)
         } else {
-            format!("recorder.{index}.log")
+            format!("{}.{index}.log", self.stem)
         })
     }
 
@@ -149,7 +131,7 @@ impl RecordingLogger {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let Some(index) = name
-                .strip_prefix("recorder.")
+                .strip_prefix(&format!("{}.", self.stem))
                 .and_then(|s| s.strip_suffix(".log"))
                 .and_then(|s| s.parse::<usize>().ok())
             else {
@@ -157,7 +139,7 @@ impl RecordingLogger {
             };
             // Only our canonical archive names; never remove subdirectories or user files.
             if index > backup_count
-                && name == format!("recorder.{index}.log")
+                && name == format!("{}.{index}.log", self.stem)
                 && entry.file_type()?.is_file()
             {
                 fs::remove_file(entry.path())?;
@@ -181,6 +163,88 @@ impl RecordingLogger {
             }
         }
         Ok(())
+    }
+}
+
+fn normalized_limits(size: u64, count: usize) -> (u64, usize) {
+    let size = if (1..=crate::settings::MAX_LOG_SIZE_MIB).contains(&size) {
+        size
+    } else {
+        crate::settings::DEFAULT_LOG_MAX_SIZE_MIB
+    };
+    let count = if (1..=crate::settings::MAX_LOG_BACKUP_COUNT).contains(&count) {
+        count
+    } else {
+        crate::settings::DEFAULT_LOG_BACKUP_COUNT
+    };
+    (size, count)
+}
+
+impl RecordingLogger {
+    pub fn new(directory: PathBuf) -> Self {
+        Self {
+            recording: RotatingLog::new(directory.clone(), "recorder", true),
+            api: RotatingLog::new(directory, "douyin-api", false),
+        }
+    }
+
+    pub fn info(&self) -> RecordingLogInfo {
+        RecordingLogInfo {
+            directory: self.recording.directory.to_string_lossy().into_owned(),
+            last_error: self.recording.last_error(),
+            api_last_error: self.api.last_error(),
+        }
+    }
+
+    pub(crate) fn apply_settings(&self, settings: &crate::settings::AppSettings) {
+        let (size, count) =
+            normalized_limits(settings.api_log_max_size_mib, settings.api_log_backup_count);
+        self.api
+            .configure(settings.api_log_enabled, size * MIB, count);
+        let (size, count) = normalized_limits(settings.log_max_size_mib, settings.log_backup_count);
+        if self.recording.configure(true, size * MIB, count) {
+            self.write(
+                "INFO",
+                "logging_configured",
+                None,
+                None,
+                json!({"max_size_mib": size, "backup_count": count}),
+            );
+        }
+    }
+
+    pub fn write(
+        &self,
+        level: &str,
+        event: &str,
+        task_id: Option<i64>,
+        room_id: Option<i64>,
+        mut details: Value,
+    ) {
+        sanitize_value(&mut details);
+        self.recording.write(&json!({
+            "timestamp": Local::now().to_rfc3339(), "level": level, "event": event,
+            "task_id": task_id, "room_id": room_id, "details": details,
+        }));
+    }
+
+    pub fn api_enabled(&self) -> bool {
+        self.api.enabled()
+    }
+
+    pub fn write_api(&self, mut record: Value) {
+        if !self.api_enabled() {
+            return;
+        }
+        // Parser error previews may be incomplete JSON. The complete body is saved
+        // separately, so apply the existing compact error policy only to metadata.
+        for key in ["error", "response_read_error"] {
+            if let Some(Value::String(text)) = record.get_mut(key) {
+                *text = sanitize_text(text);
+            }
+        }
+        sanitize_api_value(&mut record);
+        self.api.write(&record);
     }
 
     pub fn process_exit(&self, task_id: i64, exit: &crate::recorder::RecordingExit) {
@@ -310,6 +374,64 @@ fn sanitize_value(value: &mut Value) {
     }
 }
 
+// API diagnostics preserve full strings and nested JSON, unlike compact recorder errors.
+fn sanitize_api_value(value: &mut Value) {
+    sanitize_api_value_at(value, 0);
+}
+
+fn sanitize_api_value_at(value: &mut Value, depth: usize) {
+    // Bound recursion across JSON encoded inside JSON strings as well as normal objects.
+    if depth >= 128 {
+        *value = Value::String("[过深的嵌套内容已隐藏]".into());
+        return;
+    }
+    match value {
+        Value::String(text) => {
+            if let Ok(mut embedded @ (Value::Object(_) | Value::Array(_) | Value::String(_))) =
+                serde_json::from_str::<Value>(text)
+            {
+                sanitize_api_value_at(&mut embedded, depth + 1);
+                *text = embedded.to_string();
+            } else {
+                *text = text.split_inclusive('\n').map(sanitize_api_line).collect();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                sanitize_api_value_at(item, depth + 1);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if sensitive_key(key)
+                    || matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "ttwid"
+                            | "sessionid"
+                            | "sessionid_ss"
+                            | "sid_tt"
+                            | "sid_guard"
+                            | "sign"
+                            | "sign_key"
+                            | "a_bogus"
+                            | "x-bogus"
+                            | "x_bogus"
+                            | "auth"
+                            | "auth_key"
+                            | "access_key"
+                            | "api_key"
+                    )
+                {
+                    *value = Value::String("[已隐藏]".into());
+                } else {
+                    sanitize_api_value_at(value, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn sanitize_text(text: &str) -> String {
     // Parser errors contain an API response preview. Omit it, including multiline bodies.
     let text = text.split(" (响应:").next().unwrap_or(text);
@@ -327,6 +449,48 @@ fn sanitize_text(text: &str) -> String {
         result.push_str("…[过长内容已截断]");
     }
     result
+}
+
+fn sanitize_api_line(line: &str) -> String {
+    // Non-JSON responses can contain session credentials as plain text too.
+    let lower = line.to_ascii_lowercase();
+    let cut = [
+        "ttwid",
+        "sessionid",
+        "sessionid_ss",
+        "sid_tt",
+        "sid_guard",
+        "sign",
+        "sign_key",
+        "a_bogus",
+        "x-bogus",
+        "x_bogus",
+        "auth",
+        "auth_key",
+        "access_key",
+        "api_key",
+    ]
+    .iter()
+    .flat_map(|needle| lower.match_indices(needle))
+    .filter_map(|(index, needle)| {
+        // These short names must be whole keys, not the end of words like "design".
+        if index > 0
+            && lower[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        let suffix = lower[index + needle.len()..]
+            .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'));
+        (suffix.starts_with(':') || suffix.starts_with('=')).then_some(index)
+    })
+    .min();
+    match cut {
+        Some(index) => format!("{}[认证信息已隐藏]", sanitize_line(&line[..index])),
+        None => sanitize_line(line),
+    }
 }
 
 fn sanitize_line(line: &str) -> String {
@@ -391,7 +555,7 @@ mod tests {
     use super::*;
 
     pub fn read_records(logger: &RecordingLogger) -> Vec<Value> {
-        fs::read_to_string(logger.path(0))
+        fs::read_to_string(logger.recording.path(0))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -421,7 +585,7 @@ mod tests {
     fn rotates_only_owned_files_and_keeps_four_backups() {
         let dir = tempfile::tempdir().unwrap();
         let logger = RecordingLogger::new(dir.path().into());
-        logger.set_limits(250, 4);
+        logger.recording.configure(true, 250, 4);
         fs::write(dir.path().join("user.txt"), "keep").unwrap();
         for index in 0..10 {
             logger.write(
@@ -435,10 +599,11 @@ mod tests {
         assert_eq!(read_records(&logger)[0]["details"]["index"], 9);
         for index in 1..=4 {
             let record: Value =
-                serde_json::from_str(&fs::read_to_string(logger.path(index)).unwrap()).unwrap();
+                serde_json::from_str(&fs::read_to_string(logger.recording.path(index)).unwrap())
+                    .unwrap();
             assert_eq!(record["details"]["index"], 9 - index);
         }
-        assert!(!logger.path(5).exists());
+        assert!(!logger.recording.path(5).exists());
         assert_eq!(
             fs::read_to_string(dir.path().join("user.txt")).unwrap(),
             "keep"
@@ -449,7 +614,7 @@ mod tests {
     fn changed_limits_apply_to_next_write_and_prune_only_old_archives() {
         let dir = tempfile::tempdir().unwrap();
         let logger = RecordingLogger::new(dir.path().into());
-        logger.set_limits(250, 6);
+        logger.recording.configure(true, 250, 6);
         for index in 0..8 {
             logger.write(
                 "INFO",
@@ -459,7 +624,7 @@ mod tests {
                 json!({"index": index, "message": "x".repeat(100)}),
             );
         }
-        assert!(logger.path(6).exists());
+        assert!(logger.recording.path(6).exists());
         for name in ["user.log", "recorder.notes.log", "recorder.099.log"] {
             fs::write(dir.path().join(name), "keep").unwrap();
         }
@@ -471,18 +636,18 @@ mod tests {
         logger.apply_settings(&settings);
         // Increasing size does not rotate the current file. Decreasing retention prunes immediately.
         assert_eq!(read_records(&logger)[0]["details"]["index"], 7);
-        assert!(logger.path(2).exists());
+        assert!(logger.recording.path(2).exists());
         for index in 3..=6 {
-            assert!(!logger.path(index).exists());
+            assert!(!logger.recording.path(index).exists());
         }
         for name in ["user.log", "recorder.notes.log", "recorder.099.log"] {
             assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), "keep");
         }
-        logger.set_limits(250, 2);
+        logger.recording.configure(true, 250, 2);
         logger.write("INFO", "smaller", None, None, json!({}));
         assert_eq!(read_records(&logger)[0]["event"], "smaller");
-        assert!(logger.path(1).exists());
-        assert!(!logger.path(3).exists());
+        assert!(logger.recording.path(1).exists());
+        assert!(!logger.recording.path(3).exists());
         assert!(logger.info().last_error.is_none());
     }
 
@@ -490,7 +655,7 @@ mod tests {
     fn restart_loads_custom_limits_before_pruning_and_invalid_limits_fall_back() {
         let dir = tempfile::tempdir().unwrap();
         let logger = RecordingLogger::new(dir.path().into());
-        logger.set_limits(250, 6);
+        logger.recording.configure(true, 250, 6);
         for index in 0..8 {
             logger.write(
                 "INFO",
@@ -510,17 +675,20 @@ mod tests {
         let restarted = RecordingLogger::new(dir.path().into());
         restarted.apply_settings(&crate::settings::load_settings_from(&settings_path).unwrap());
         assert!(
-            restarted.path(6).exists(),
+            restarted.recording.path(6).exists(),
             "startup must not prune using defaults first"
         );
         assert_eq!(read_records(&restarted)[0]["details"]["index"], 7);
-        assert_eq!(restarted.state.lock().unwrap().max_file_bytes, 50 * MIB);
+        assert_eq!(
+            restarted.recording.state.lock().unwrap().max_file_bytes,
+            50 * MIB
+        );
         restarted.apply_settings(&crate::settings::AppSettings {
             log_max_size_mib: 0,
             log_backup_count: usize::MAX,
             ..Default::default()
         });
-        let state = restarted.state.lock().unwrap();
+        let state = restarted.recording.state.lock().unwrap();
         assert_eq!(state.max_file_bytes, 5 * MIB);
         assert_eq!(state.backup_count, 4);
     }
@@ -529,11 +697,13 @@ mod tests {
     fn concurrent_records_do_not_interleave() {
         let dir = tempfile::tempdir().unwrap();
         let logger = Arc::new(RecordingLogger::new(dir.path().into()));
+        logger.api.configure(true, 5 * MIB, 4);
         let workers: Vec<_> = (0..8)
             .map(|id| {
                 let logger = logger.clone();
                 std::thread::spawn(move || {
                     for index in 0..25 {
+                        logger.write_api(json!({"worker": id, "index": index, "response": {"prompts": "直播已结束"}}));
                         logger.write(
                             "INFO",
                             "concurrent",
@@ -549,7 +719,190 @@ mod tests {
             worker.join().unwrap();
         }
         assert_eq!(read_records(&logger).len(), 200);
+        let api_records: Vec<Value> = fs::read_to_string(logger.api.path(0))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(api_records.len(), 200);
+        for record in api_records {
+            assert_eq!(record["response"]["prompts"], "直播已结束");
+        }
         assert!(logger.info().last_error.is_none());
+        assert!(logger.info().api_last_error.is_none());
+    }
+
+    #[test]
+    fn api_log_is_opt_in_and_disabled_files_survive_restart_and_limit_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        let logger = RecordingLogger::new(log_dir.clone());
+        logger.write_api(json!({"response": {"data": "not captured"}}));
+        assert!(!log_dir.exists());
+        let mut settings = crate::settings::AppSettings {
+            api_log_enabled: true,
+            api_log_max_size_mib: 20,
+            api_log_backup_count: 6,
+            ..Default::default()
+        };
+        logger.apply_settings(&settings);
+        logger.write_api(json!({"response": {"data": "captured"}}));
+        fs::write(logger.api.path(6), "history").unwrap();
+        let before = fs::read(logger.api.path(0)).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        crate::settings::save_settings_at(&settings, &settings_path).unwrap();
+        let restarted = RecordingLogger::new(log_dir);
+        restarted.apply_settings(&crate::settings::load_settings_from(&settings_path).unwrap());
+        assert!(restarted.api_enabled());
+        assert_eq!(restarted.api.state.lock().unwrap().max_file_bytes, 20 * MIB);
+        settings.api_log_enabled = false;
+        settings.api_log_backup_count = 1;
+        restarted.apply_settings(&settings);
+        restarted.write_api(json!({"response": "must not write or prune"}));
+        assert_eq!(fs::read(restarted.api.path(0)).unwrap(), before);
+        assert!(restarted.api.path(6).exists());
+        settings.api_log_enabled = true;
+        restarted.apply_settings(&settings);
+        restarted.write_api(json!({"response": "new request"}));
+        assert!(!restarted.api.path(6).exists());
+        assert!(fs::read(restarted.api.path(0))
+            .unwrap()
+            .starts_with(&before));
+        settings.api_log_max_size_mib = 0;
+        settings.api_log_backup_count = 101;
+        restarted.apply_settings(&settings);
+        let state = restarted.api.state.lock().unwrap();
+        assert_eq!(state.max_file_bytes, 5 * MIB);
+        assert_eq!(state.backup_count, 4);
+    }
+
+    #[test]
+    fn api_rotation_preserves_full_oversized_json_and_other_log_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = RecordingLogger::new(dir.path().into());
+        logger.api.configure(true, MIB, 2);
+        logger.recording.configure(true, 250, 4);
+        for index in 0..6 {
+            logger.write(
+                "INFO",
+                "sample",
+                None,
+                None,
+                json!({"index": index, "text": "x".repeat(200)}),
+            );
+        }
+        let recorder_files: Vec<_> = (0..=4)
+            .map(|i| fs::read(logger.recording.path(i)).unwrap())
+            .collect();
+        let large = "中".repeat(MIB as usize / 3 + 200);
+        let record = json!({"response": {"large": large, "tail": [1, true, null, "完整末尾"]}});
+        for name in ["user.log", "douyin-api.notes.log", "douyin-api.099.log"] {
+            fs::write(dir.path().join(name), "keep").unwrap();
+        }
+        for _ in 0..5 {
+            logger.write_api(record.clone());
+        }
+        for index in 0..=2 {
+            let bytes = fs::read(logger.api.path(index)).unwrap();
+            assert!(bytes.len() > MIB as usize);
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), record);
+        }
+        assert!(!logger.api.path(3).exists());
+        logger.api.configure(true, MIB, 1);
+        logger.write_api(json!({"response": "next"}));
+        assert!(!logger.api.path(2).exists());
+        for (index, before) in recorder_files.iter().enumerate() {
+            assert_eq!(&fs::read(logger.recording.path(index)).unwrap(), before);
+        }
+        let api_before = fs::read(logger.api.path(1)).unwrap();
+        logger.recording.configure(true, 250, 1);
+        logger.write("INFO", "prune", None, None, json!({}));
+        assert_eq!(fs::read(logger.api.path(1)).unwrap(), api_before);
+        for name in ["user.log", "douyin-api.notes.log", "douyin-api.099.log"] {
+            assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), "keep");
+        }
+    }
+
+    #[test]
+    fn api_redaction_preserves_nested_json_strings_and_long_ordinary_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = RecordingLogger::new(dir.path().into());
+        logger.api.configure(true, 5 * MIB, 4);
+        let embedded = json!({"items": [{"access_token": "nested-credential", "status": 2}],
+            "stream_data": json!({"url": "https://user:password@cdn.test/signed-path?sig=private-query", "codec": "h264"}).to_string()});
+        let long = format!("{} (响应: 普通文字)\n", "文".repeat(20_000));
+        logger.write_api(json!({"response": {
+            "status_code": 0, "message": "room has finished", "prompts": "直播已结束",
+            "cookie": "cookie-credential", "sessionid": "session-credential", "ttwid": "ttwid-credential",
+            "nested": embedded.to_string(), "ordinary": long, "null": null
+        }}));
+        let text = fs::read_to_string(logger.api.path(0)).unwrap();
+        for secret in [
+            "nested-credential",
+            "cookie-credential",
+            "session-credential",
+            "ttwid-credential",
+            "signed-path",
+            "private-query",
+            "user:password",
+        ] {
+            assert!(!text.contains(secret), "leaked {secret}");
+        }
+        let record: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(record["response"]["ordinary"], long);
+        assert_eq!(record["response"]["message"], "room has finished");
+        assert_eq!(record["response"]["status_code"], 0);
+        let nested: Value =
+            serde_json::from_str(record["response"]["nested"].as_str().unwrap()).unwrap();
+        assert_eq!(nested["items"][0]["status"], 2);
+        assert_eq!(nested["items"][0]["access_token"], "[已隐藏]");
+        let streams: Value = serde_json::from_str(nested["stream_data"].as_str().unwrap()).unwrap();
+        assert_eq!(streams["codec"], "h264");
+        assert_eq!(streams["url"], "https://cdn.test/[链接已隐藏]");
+    }
+
+    #[test]
+    fn api_write_failure_is_independent_and_remains_visible_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = RecordingLogger::new(dir.path().into());
+        logger.api.configure(true, MIB, 4);
+        fs::create_dir(logger.api.path(0)).unwrap();
+        logger.write_api(json!({"response": {}}));
+        let error = logger.info().api_last_error.unwrap();
+        logger.write("INFO", "still works", None, None, json!({}));
+        assert!(logger.info().last_error.is_none());
+        fs::remove_dir(logger.api.path(0)).unwrap();
+        logger.write_api(json!({"response": "recovered"}));
+        assert!(logger.api.path(0).is_file());
+        assert_eq!(
+            logger.info().api_last_error.as_deref(),
+            Some(error.as_str())
+        );
+    }
+
+    #[test]
+    fn api_text_and_error_previews_cannot_expose_session_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = RecordingLogger::new(dir.path().into());
+        logger.api.configure(true, MIB, 4);
+        logger.write_api(json!({
+            "error": "解析失败 (响应: {\"sessionid\":\"preview-secret\"}",
+            "response_format": "text",
+            "response": "broken JSON: {\"sessionid\":\"body-secret\"\nTTWID = another-secret\nsign: signed-secret\n普通文本 design:保留\n最后一行"
+        }));
+        let text = fs::read_to_string(logger.api.path(0)).unwrap();
+        for secret in [
+            "preview-secret",
+            "body-secret",
+            "another-secret",
+            "signed-secret",
+        ] {
+            assert!(!text.contains(secret));
+        }
+        let record: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(record["error"], "解析失败");
+        assert!(record["response"].as_str().unwrap().contains("design:保留"));
+        assert!(record["response"].as_str().unwrap().ends_with("最后一行"));
     }
 
     #[test]
@@ -579,7 +932,7 @@ mod tests {
             "nested": {"cookie": "nested-secret", "password": "password-secret"},
             "ordinary": "录制进程已结束，但主播仍在直播"
         }));
-        let text = fs::read_to_string(logger.path(0)).unwrap();
+        let text = fs::read_to_string(logger.recording.path(0)).unwrap();
         for secret in [
             "private-body",
             "private-body-2",

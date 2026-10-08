@@ -65,6 +65,9 @@ export interface AppSettings {
   notify_updates: boolean
   log_max_size_mib: number
   log_backup_count: number
+  api_log_enabled: boolean
+  api_log_max_size_mib: number
+  api_log_backup_count: number
 }
 
 export interface LifecycleStatus {
@@ -76,6 +79,7 @@ export interface LifecycleStatus {
 export interface RecordingLogInfo {
   directory: string
   last_error: string | null
+  api_last_error: string | null
 }
 
 export interface UpdateInfo {

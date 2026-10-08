@@ -52,6 +52,9 @@ pub struct AppSettings {
     pub close_behavior: CloseBehavior,
     pub log_max_size_mib: u64,
     pub log_backup_count: usize,
+    pub api_log_enabled: bool,
+    pub api_log_max_size_mib: u64,
+    pub api_log_backup_count: usize,
 }
 
 impl Default for AppSettings {
@@ -86,6 +89,9 @@ impl Default for AppSettings {
             close_behavior: CloseBehavior::Exit,
             log_max_size_mib: DEFAULT_LOG_MAX_SIZE_MIB,
             log_backup_count: DEFAULT_LOG_BACKUP_COUNT,
+            api_log_enabled: false,
+            api_log_max_size_mib: DEFAULT_LOG_MAX_SIZE_MIB,
+            api_log_backup_count: DEFAULT_LOG_BACKUP_COUNT,
         }
     }
 }
@@ -127,6 +133,16 @@ pub fn load_settings_from(path: &Path) -> Result<AppSettings, String> {
 }
 
 pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), String> {
+    if !(1..=MAX_LOG_SIZE_MIB).contains(&settings.api_log_max_size_mib) {
+        return Err(format!(
+            "单个接口日志大小必须在 1 到 {MAX_LOG_SIZE_MIB} MiB 之间"
+        ));
+    }
+    if !(1..=MAX_LOG_BACKUP_COUNT).contains(&settings.api_log_backup_count) {
+        return Err(format!(
+            "接口日志历史保留份数必须在 1 到 {MAX_LOG_BACKUP_COUNT} 之间"
+        ));
+    }
     if !(1..=MAX_LOG_SIZE_MIB).contains(&settings.log_max_size_mib) {
         return Err(format!(
             "单个日志大小必须在 1 到 {MAX_LOG_SIZE_MIB} MiB 之间"
@@ -193,6 +209,37 @@ mod tests {
             settings.log_backup_count = count;
             assert!(save_settings_at(&settings, &path).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn api_log_settings_upgrade_roundtrip_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"quality":"HD1","log_max_size_mib":10}"#).unwrap();
+        let mut settings = load_settings_from(&path).unwrap();
+        assert!(!settings.api_log_enabled);
+        assert_eq!(settings.api_log_max_size_mib, 5);
+        assert_eq!(settings.api_log_backup_count, 4);
+        settings.api_log_enabled = true;
+        settings.api_log_max_size_mib = 20;
+        settings.api_log_backup_count = 6;
+        save_settings_at(&settings, &path).unwrap();
+        let loaded = load_settings_from(&path).unwrap();
+        assert!(loaded.api_log_enabled);
+        assert_eq!(loaded.api_log_max_size_mib, 20);
+        assert_eq!(loaded.api_log_backup_count, 6);
+        assert_eq!(loaded.log_max_size_mib, 10);
+        assert_eq!(loaded.quality, "HD1");
+        let original = std::fs::read(&path).unwrap();
+        for enabled in [false, true] {
+            for (size, count) in [(0, 4), (1025, 4), (5, 0), (5, 101)] {
+                settings.api_log_enabled = enabled;
+                settings.api_log_max_size_mib = size;
+                settings.api_log_backup_count = count;
+                assert!(save_settings_at(&settings, &path).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
         }
     }
 

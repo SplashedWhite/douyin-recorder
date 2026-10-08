@@ -23,7 +23,7 @@ use auto_policy::{AutoMonitorMode, PostRecordAction, TickAction};
 use auto_recorder::AutoRecorder;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use database::{Database, LiveRoom, RecordTask};
-use parser::{DouyinParser, LiveInfo};
+use parser::{DouyinParser, LiveInfo, RequestSource};
 use recorder::{Recorder, RecordingExit};
 use serde::Serialize;
 use serde_json::json;
@@ -256,7 +256,7 @@ async fn refresh_room_internal(state: &AppState, room_id: i64) -> Result<LiveRoo
     let app_settings = settings::load_settings();
     let info = state
         .parser
-        .parse_douyin_url(&douyin_url, &app_settings)
+        .parse_douyin_url(&douyin_url, &app_settings, RequestSource::ManualRefresh)
         .await
         .map_err(|e| e.to_string())?;
     apply_live_info(state, room_id, &info)
@@ -382,7 +382,11 @@ async fn handle_recording_exit(
         let url = format!("https://live.douyin.com/{}", room.room_id);
         let result = state
             .parser
-            .parse_douyin_url(&url, &settings::load_settings())
+            .parse_douyin_url(
+                &url,
+                &settings::load_settings(),
+                RequestSource::RecordingVerification,
+            )
             .await;
         match result {
             Ok(info) => {
@@ -867,7 +871,11 @@ async fn check_auto_room(app: &AppHandle, snapshot: LiveRoom) -> Result<(), Stri
     };
     let settings = settings::load_settings();
     let url = format!("https://live.douyin.com/{}", snapshot.room_id);
-    let info = match state.parser.parse_douyin_url(&url, &settings).await {
+    let info = match state
+        .parser
+        .parse_douyin_url(&url, &settings, RequestSource::AutoCheck)
+        .await
+    {
         Ok(info) => info,
         Err(error) => {
             return handle_check_error(
@@ -1097,7 +1105,7 @@ async fn add_room(state: State<'_, AppState>, url: String) -> Result<LiveRoom, S
     let app_settings = settings::load_settings();
     let info = state
         .parser
-        .parse_douyin_url(&url, &app_settings)
+        .parse_douyin_url(&url, &app_settings, RequestSource::AddRoom)
         .await
         .map_err(|e| e.to_string())?;
     let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -1262,7 +1270,7 @@ async fn start_record(
     let app_settings = settings::load_settings();
     let info = state
         .parser
-        .parse_douyin_url(&douyin_url, &app_settings)
+        .parse_douyin_url(&douyin_url, &app_settings, RequestSource::ManualStart)
         .await
         .map_err(|error| {
             recording_log::event("ERROR", "recording_start_failed", None, Some(room_id),
