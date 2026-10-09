@@ -24,7 +24,7 @@ where
 {
     let _start_guard = state.start_lock.blocking_lock();
     let mut db = state.db.lock().map_err(|e| e.to_string())?;
-    if state.recorder.has_active_records()? {
+    if state.recorder.has_active_records()? || state.recoveries.any_busy() {
         return Err("有任务正在录制或结束处理中，请等待结束后再迁移数据库".to_string());
     }
     db.migrate_to(new_path, persist_path)
@@ -75,6 +75,9 @@ mod tests {
                 recorder: Recorder::new("unused-ffmpeg".to_string()),
                 parser: DouyinParser::new(),
                 auto_recorder: AutoRecorder::new(),
+                recoveries: crate::recovery::Recoveries::default(),
+                #[cfg(test)]
+                test_settings: None,
                 start_lock: AsyncMutex::new(()),
                 lifecycle: Default::default(),
             });

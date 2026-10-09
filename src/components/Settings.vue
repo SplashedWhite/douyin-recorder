@@ -108,6 +108,90 @@
 
       <div class="settings-section">
         <div class="section-header">
+          <span class="section-label">录制网络与重连</span>
+        </div>
+        <div class="auto-settings-panel">
+          <div class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">网络读写超时</div>
+              <div class="auto-setting-hint">连接没有响应时的等待时间，默认 20 秒</div>
+            </div>
+            <div class="number-setting">
+              <el-input-number v-model="form.ffmpeg_rw_timeout_secs" aria-label="网络读写超时" :min="1" :max="3600" :precision="0" :step="1" controls-position="right" />
+              <span>秒</span>
+            </div>
+          </div>
+          <div class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">断线重连</div>
+              <div class="auto-setting-hint">默认关闭，可按需开启，在短暂网络故障时尝试继续接收直播流</div>
+            </div>
+            <el-switch v-model="form.ffmpeg_reconnect_enabled" aria-label="断线重连" />
+          </div>
+          <template v-if="form.ffmpeg_reconnect_enabled">
+            <div class="auto-setting-row">
+              <div>
+                <div class="auto-setting-label">重连次数限制</div>
+                <div class="auto-setting-hint">一轮连接重试的次数限制，默认 5 次</div>
+              </div>
+              <div class="number-setting">
+                <el-input-number v-model="form.ffmpeg_reconnect_max_retries" aria-label="重连次数限制" :min="1" :max="100" :precision="0" :step="1" controls-position="right" />
+                <span>次</span>
+              </div>
+            </div>
+            <div class="auto-setting-row">
+              <div>
+                <div class="auto-setting-label">单次重连等待阈值</div>
+                <div class="auto-setting-hint">重试间隔逐步增加，超过阈值时放弃</div>
+              </div>
+              <div class="number-setting">
+                <el-input-number v-model="form.ffmpeg_reconnect_delay_max_secs" aria-label="单次重连等待阈值" :min="1" :max="3600" :precision="0" :step="1" controls-position="right" />
+                <span>秒</span>
+              </div>
+            </div>
+            <div class="auto-setting-row">
+              <div>
+                <div class="auto-setting-label">累计重连等待阈值</div>
+                <div class="auto-setting-hint">累计的重试间隔超过阈值时放弃</div>
+              </div>
+              <div class="number-setting">
+                <el-input-number v-model="form.ffmpeg_reconnect_delay_total_max_secs" aria-label="累计重连等待阈值" :min="1" :max="3600" :precision="0" :step="1" controls-position="right" />
+                <span>秒</span>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="quality-note">保存后对新启动的录制生效，正在录制的任务继续使用原值。重连适用于 HTTP/HTTPS 直播流，无需开启持续监控。</div>
+        <div v-if="form.ffmpeg_reconnect_enabled" class="quality-note">累计等待只计算重试间隔，不包含连接和读写耗时，因此不是整个恢复过程的总时限。进程退出后，可由下面的软件断流恢复继续尝试。</div>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header"><span class="section-label">软件断流恢复</span></div>
+        <div class="auto-settings-panel">
+          <div class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">软件断流恢复</div>
+              <div class="auto-setting-hint">默认关闭，开启后在录制意外退出时重新确认直播、获取新地址并续录，无需持续监控</div>
+            </div>
+            <el-switch v-model="form.recording_recovery_enabled" aria-label="软件断流恢复" />
+          </div>
+          <div v-if="form.recording_recovery_enabled" class="auto-setting-row">
+            <div>
+              <div class="auto-setting-label">最长恢复时间</div>
+              <div class="auto-setting-hint">包含查询和等待，默认 120 秒；保存后用于下一轮恢复</div>
+            </div>
+            <div class="number-setting">
+              <el-input-number v-model="form.recording_recovery_timeout_secs" aria-label="最长恢复时间" :min="10" :max="3600" :precision="0" :step="1" controls-position="right" />
+              <span>秒</span>
+            </div>
+          </div>
+        </div>
+        <div class="quality-note">恢复会创建新文件，历史记录标注“断流恢复”。保存关闭开关后立即取消待恢复流程，已开始的录制继续运行。</div>
+        <div class="quality-note">房间的“停止恢复”保留监控和定时配置，稍后可能再次自动录制。重试间隔固定为 3、5、10、20 秒，之后每次 20 秒。</div>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header">
           <span class="section-label">录制保存目录</span>
           <span class="section-hint">留空使用默认目录</span>
         </div>
@@ -297,7 +381,7 @@ const migrating = ref(false)
 const migrationTarget = ref('')
 const hasRunningTasks = computed(() => store.tasks.some(task =>
   task.status === 'recording' || task.status === 'finalizing' || task.segments?.some(segment => ['queued', 'converting'].includes(segment.conversion_state))
-))
+) || Object.values(store.recoveries || {}).some(status => ['confirming', 'waiting', 'starting'].includes(status.phase)))
 const version = ref('')
 const logInfo = ref<RecordingLogInfo | null>(null)
 const logInfoError = ref('')
@@ -343,6 +427,13 @@ const form = reactive({
   auto_convert_mp4: false,
   segment_recording_enabled: false,
   segment_duration_minutes: 60,
+  ffmpeg_reconnect_enabled: false,
+  recording_recovery_enabled: false,
+  recording_recovery_timeout_secs: 120,
+  ffmpeg_rw_timeout_secs: 20,
+  ffmpeg_reconnect_max_retries: 5,
+  ffmpeg_reconnect_delay_max_secs: 15,
+  ffmpeg_reconnect_delay_total_max_secs: 30,
   time_format_24h: true,
   time_display_mode: 'absolute',
   auto_check_interval_secs: 60,
@@ -376,6 +467,13 @@ function onOpen() {
   form.auto_convert_mp4 = store.settings.auto_convert_mp4 ?? false
   form.segment_recording_enabled = store.settings.segment_recording_enabled ?? false
   form.segment_duration_minutes = store.settings.segment_duration_minutes ?? 60
+  form.ffmpeg_reconnect_enabled = store.settings.ffmpeg_reconnect_enabled ?? false
+  form.recording_recovery_enabled = store.settings.recording_recovery_enabled ?? false
+  form.recording_recovery_timeout_secs = store.settings.recording_recovery_timeout_secs ?? 120
+  form.ffmpeg_rw_timeout_secs = store.settings.ffmpeg_rw_timeout_secs ?? 20
+  form.ffmpeg_reconnect_max_retries = store.settings.ffmpeg_reconnect_max_retries ?? 5
+  form.ffmpeg_reconnect_delay_max_secs = store.settings.ffmpeg_reconnect_delay_max_secs ?? 15
+  form.ffmpeg_reconnect_delay_total_max_secs = store.settings.ffmpeg_reconnect_delay_total_max_secs ?? 30
   form.time_format_24h = store.settings.time_format_24h ?? true
   form.time_display_mode = store.settings.time_display_mode || 'absolute'
   form.auto_check_interval_secs = store.settings.auto_check_interval_secs ?? 60
@@ -412,7 +510,22 @@ async function onMigrate() {
 }
 
 async function onSave() {
+  if (!Number.isInteger(form.recording_recovery_timeout_secs) || form.recording_recovery_timeout_secs < 10 || form.recording_recovery_timeout_secs > 3600) {
+    ElMessage.error('最长恢复时间必须为 10 到 3600 秒的整数')
+    return
+  }
   if (migrating.value || saving.value) return
+  for (const [label, value, max, unit] of [
+    ['网络读写超时', form.ffmpeg_rw_timeout_secs, 3600, '秒'],
+    ['重连次数限制', form.ffmpeg_reconnect_max_retries, 100, '次'],
+    ['单次重连等待阈值', form.ffmpeg_reconnect_delay_max_secs, 3600, '秒'],
+    ['累计重连等待阈值', form.ffmpeg_reconnect_delay_total_max_secs, 3600, '秒'],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 1 || value > max) {
+      ElMessage.error(`${label}必须是 1 到 ${max} ${unit}的整数`)
+      return
+    }
+  }
   if (!Number.isInteger(form.segment_duration_minutes) || form.segment_duration_minutes < 1) {
     ElMessage.error('分段时长必须为正整数分钟')
     return

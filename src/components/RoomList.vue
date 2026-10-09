@@ -109,21 +109,27 @@
             <div v-if="room.auto_record_error" class="automation-error" :title="room.auto_record_error">
               {{ room.auto_record_error }}
             </div>
+            <div v-if="recoveryPending(recoveries[room.id]) && !isRecording(room.id)" class="automation-summary" role="status" :title="recoveries[room.id]?.last_error || undefined">
+              {{ recoveryText(recoveries[room.id], displayNow) }}
+              <div class="automation-summary">停止恢复仍保留监控，稍后可能再次自动录制</div>
+            </div>
           </div>
 
           <!-- Actions -->
           <div class="room-actions">
+            <el-button v-if="recoveryPending(recoveries[room.id]) && !isRecording(room.id)" size="small" type="warning" @click="stopRecovery(room.id)">停止恢复</el-button>
             <el-button
+              v-else
               size="small"
               :type="isRecording(room.id) ? 'warning' : 'primary'"
               @click="toggleRecord(room)"
               class="record-btn"
-              :disabled="isFinalizing(room.id)"
+              :disabled="!isRecording(room.id) && isFinalizing(room.id)"
               :title="isRecording(room.id) && room.auto_monitor_mode === 'continuous' && room.auto_record_enabled ? '停止当前录制，同时关闭该房间的持续监控' : undefined"
             >
               <el-icon v-if="isRecording(room.id)" class="btn-icon"><VideoPause /></el-icon>
               <el-icon v-else class="btn-icon"><VideoPlay /></el-icon>
-              {{ isFinalizing(room.id) ? '收尾中' : isRecording(room.id) ? '停止' : '录制' }}
+              {{ isRecording(room.id) ? '停止' : isFinalizing(room.id) ? '收尾中' : '录制' }}
             </el-button>
             <button
               class="icon-btn"
@@ -201,13 +207,14 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
+import { recoveryPending, recoveryText } from '../utils/recovery'
 import { Plus, Delete, VideoPlay, VideoPause, Refresh, Timer, Setting } from '@element-plus/icons-vue'
 import { useRecorderStore } from '../stores/recorder'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { AutoMonitorMode, LiveRoom } from '../types'
 
 const store = useRecorderStore()
-const { rooms, tasks, settings, loading, isRefreshingAll } = storeToRefs(store)
+const { rooms, tasks, recoveries, settings, loading, isRefreshingAll } = storeToRefs(store)
 
 const newUrl = ref('')
 const refreshingIds = ref(new Set<number>())
@@ -223,7 +230,7 @@ let displayTimer: number | undefined
 onMounted(() => {
   displayTimer = window.setInterval(() => {
     displayNow.value = Date.now()
-  }, 60_000)
+  }, 1_000)
 })
 
 onBeforeUnmount(() => {
@@ -243,7 +250,11 @@ function isRecording(roomId: number) {
 }
 
 function isFinalizing(roomId: number) {
-  return tasks.value.some(task => task.room_id === roomId && task.status === 'finalizing')
+  return !isRecording(roomId) && tasks.value.some(task => task.room_id === roomId && task.status === 'finalizing')
+}
+
+async function stopRecovery(roomId: number) {
+  try { await store.cancelRecovery(roomId) } catch (error) { ElMessage.error(`停止恢复失败: ${error}`) }
 }
 
 function getAutoRecordText(room: LiveRoom) {
@@ -251,6 +262,7 @@ function getAutoRecordText(room: LiveRoom) {
 }
 
 function getAutomationSummary(room: LiveRoom) {
+  if (recoveryPending(recoveries.value[room.id])) return '断流恢复期间暂停常规自动检测'
   const mode = room.auto_monitor_mode === 'continuous' ? '持续监控' : '限时监控'
   if (room.auto_record_error && !room.auto_record_enabled) return `${mode}已暂停 · 需要处理`
   if (isFinalizing(room.id)) return `${mode} · 录制收尾中${room.auto_record_enabled ? '' : ' · 监控已关闭'}`

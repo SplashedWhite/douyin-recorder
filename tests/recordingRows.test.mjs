@@ -35,6 +35,17 @@ test('deleted segments stay hidden without showing an extra parent row', () => {
   assert.deepEqual(recordingRows([session({ segments: [segment(1, { deleted: true })] })]), [])
 })
 
+test('recovered single files and segments retain their original trigger and predecessor marker', () => {
+  const rows = recordingRows([
+    session({ id: 43, trigger: 'manual', recovery_from_task_id: 40, segment_output: null, file_path: 'new.flv' }),
+    session({ id: 44, trigger: 'auto', recovery_from_task_id: 41, segments: [segment(1)] }),
+  ])
+  assert.equal(rows.find(row => row.id === 43).recovery_from_task_id, 40)
+  assert.equal(rows.find(row => row.id === 43).trigger, 'manual')
+  assert.equal(rows.find(row => row.id === 44).recovery_from_task_id, 41)
+  assert.equal(rows.find(row => row.id === 44).trigger, 'auto')
+})
+
 test('old single-file history and start failures remain accessible', () => {
   const legacy = session({ id: 8, segment_output: null, status: 'completed', file_path: 'old.flv' })
   const failed = session({ id: 9, status: 'failed' })

@@ -81,6 +81,88 @@ test('legacy settings default to disabled API capture and hide its independent l
   assert.match(html, /douyin-api\.log/)
 })
 
+test('network settings default off and preserve opt-in with custom seconds for future recordings', async () => {
+  const { state, html, saved } = await settingsFixture()
+  assert.equal(state.form.ffmpeg_reconnect_enabled, false)
+  assert.equal(state.form.ffmpeg_rw_timeout_secs, 20)
+  assert.equal(state.form.ffmpeg_reconnect_max_retries, 5)
+  assert.equal(state.form.ffmpeg_reconnect_delay_max_secs, 15)
+  assert.equal(state.form.ffmpeg_reconnect_delay_total_max_secs, 30)
+  assert.match(html, /aria-label="网络读写超时"/)
+  assert.doesNotMatch(html, /aria-label="重连次数限制"/)
+  const enabled = await settingsFixture({ ffmpeg_reconnect_enabled: true })
+  assert.equal(enabled.state.form.ffmpeg_reconnect_enabled, true)
+  assert.match(enabled.html, /aria-label="重连次数限制"/)
+  assert.match(html, /保存后对新启动的录制生效/)
+  state.form.ffmpeg_reconnect_enabled = true
+  state.form.ffmpeg_rw_timeout_secs = 15
+  state.form.ffmpeg_reconnect_max_retries = 3
+  state.form.ffmpeg_reconnect_delay_max_secs = 8
+  state.form.ffmpeg_reconnect_delay_total_max_secs = 25
+  await state.onSave()
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].ffmpeg_reconnect_enabled, true)
+  assert.equal(saved[0].ffmpeg_rw_timeout_secs, 15)
+  assert.equal(saved[0].ffmpeg_reconnect_max_retries, 3)
+  assert.equal(saved[0].ffmpeg_reconnect_delay_max_secs, 8)
+  assert.equal(saved[0].ffmpeg_reconnect_delay_total_max_secs, 25)
+  state.onOpen()
+  assert.equal(state.form.ffmpeg_reconnect_enabled, true)
+  assert.equal(state.form.ffmpeg_rw_timeout_secs, 15)
+})
+
+test('software recovery defaults off, preserves opt-in and custom bounds, and rejects invalid saves', async () => {
+  const { state, html, saved, errors } = await settingsFixture()
+  assert.equal(state.form.recording_recovery_enabled, false)
+  assert.equal(state.form.recording_recovery_timeout_secs, 120)
+  assert.doesNotMatch(html, /aria-label="最长恢复时间"/)
+  const enabled = await settingsFixture({ recording_recovery_enabled: true })
+  assert.equal(enabled.state.form.recording_recovery_enabled, true)
+  assert.match(enabled.html, /aria-label="最长恢复时间"/)
+  assert.match(html, /停止恢复.*保留监控/)
+  state.form.recording_recovery_enabled = true
+  state.form.recording_recovery_timeout_secs = 15
+  await state.onSave()
+  assert.equal(saved[0].recording_recovery_enabled, true)
+  assert.equal(saved[0].recording_recovery_timeout_secs, 15)
+  state.onOpen()
+  assert.equal(state.form.recording_recovery_enabled, true)
+  assert.equal(state.form.recording_recovery_timeout_secs, 15)
+  for (const invalid of [0, 9, 3601, 10.5, undefined]) {
+    state.form.recording_recovery_timeout_secs = invalid
+    await state.onSave()
+  }
+  assert.equal(saved.length, 1)
+  assert.equal(errors.length, 5)
+  const disabled = await settingsFixture({ recording_recovery_enabled: false })
+  assert.doesNotMatch(disabled.html, /aria-label="最长恢复时间"/)
+  await disabled.state.onSave()
+  assert.equal(disabled.saved[0].recording_recovery_enabled, false)
+  assert.equal(disabled.saved[0].recording_recovery_timeout_secs, 120)
+})
+
+test('disabling reconnect retains its limits and invalid network values cannot save', async () => {
+  const { state, html, saved, errors } = await settingsFixture({ ffmpeg_reconnect_enabled: false })
+  assert.match(html, /aria-label="网络读写超时"/)
+  assert.doesNotMatch(html, /aria-label="重连次数限制"/)
+  await state.onSave()
+  assert.equal(saved[0].ffmpeg_reconnect_enabled, false)
+  assert.equal(saved[0].ffmpeg_reconnect_max_retries, 5)
+  for (const [field, max] of [
+    ['ffmpeg_rw_timeout_secs', 3600], ['ffmpeg_reconnect_max_retries', 100],
+    ['ffmpeg_reconnect_delay_max_secs', 3600], ['ffmpeg_reconnect_delay_total_max_secs', 3600],
+  ]) {
+    const previous = state.form[field]
+    for (const value of [0, max + 1, 1.5, undefined]) {
+      state.form[field] = value
+      await state.onSave()
+    }
+    state.form[field] = previous
+  }
+  assert.equal(saved.length, 1)
+  assert.equal(errors.length, 16)
+})
+
 test('enabled API capture renders separate limits and saves them without changing recording limits', async () => {
   const fixture = await settingsFixture({ api_log_enabled: true, api_log_max_size_mib: 20, api_log_backup_count: 6 })
   const { state, html, saved } = fixture

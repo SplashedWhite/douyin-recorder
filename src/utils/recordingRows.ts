@@ -9,6 +9,7 @@ export interface TaskRow {
   start_time: string
   file_path: string | null
   trigger: RecordTask['trigger']
+  recovery_from_task_id: number | null
   conversionState?: RecordSegment['conversion_state']
   conversionError?: string | null
 }
@@ -28,6 +29,7 @@ export function recordingRows(sessions: RecordTask[]): TaskRow[] {
       start_time: segment.start_time,
       file_path: segment.file_path,
       trigger: task.trigger,
+      recovery_from_task_id: task.recovery_from_task_id,
       conversionState: segment.conversion_state,
       conversionError: segment.conversion_error,
     }))

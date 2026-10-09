@@ -1,8 +1,14 @@
+use crate::AppHandle;
 use std::path::Path;
-use tauri::{AppHandle, Manager};
+use tauri::Manager;
 
 // All automatic and manual remuxes share one FIFO lock. Only metadata waits in RAM.
 static QUEUE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub async fn hold_queue() -> tokio::sync::MutexGuard<'static, ()> {
+    QUEUE.lock().await
+}
 
 pub async fn remux(file_path: String) -> Result<(String, i64), String> {
     remux_with(crate::resolve_ffmpeg_path(), file_path).await

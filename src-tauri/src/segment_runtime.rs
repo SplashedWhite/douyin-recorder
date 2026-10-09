@@ -1,5 +1,6 @@
 use crate::segments::{ManifestReader, SegmentOutput};
-use tauri::{AppHandle, Emitter, Manager};
+use crate::AppHandle;
+use tauri::{Emitter, Manager};
 use tokio::sync::watch;
 
 pub fn emit_segments(app: &AppHandle, task_id: i64) -> Result<(), String> {
@@ -16,10 +17,10 @@ pub async fn monitor(
     task_id: i64,
     output: SegmentOutput,
     mut stop: watch::Receiver<bool>,
+    work: std::sync::Arc<crate::lifecycle::Operation>,
 ) -> Result<(), String> {
     let mut reader = ManifestReader::default();
     let mut entries = vec![];
-    let mut jobs = tokio::task::JoinSet::new();
     let mut last_snapshot = String::new();
     let failure = loop {
         let stopped = *stop.borrow() || stop.has_changed().is_err();
@@ -30,7 +31,7 @@ pub async fn monitor(
             db.observe_segments(task_id, &output, &entries)
                 .map_err(|e| e.to_string())?;
             let mut ids = vec![];
-            if crate::settings::load_settings().auto_convert_mp4 {
+            if state.settings().auto_convert_mp4 {
                 for segment in db.get_segments(task_id).map_err(|e| e.to_string())? {
                     if segment.status == "completed"
                         && segment.conversion_state == "idle"
@@ -54,15 +55,12 @@ pub async fn monitor(
             Ok(ids) => {
                 for id in ids {
                     let app = app.clone();
-                    jobs.spawn(
-                        async move { crate::conversion::convert_claimed_segment(app, id).await },
-                    );
+                    queue_conversion(app, id, work.clone());
                 }
                 None
             }
             Err(error) => Some(error),
         };
-        while jobs.try_join_next().is_some() {}
         if stopped {
             break failure;
         }
@@ -71,12 +69,17 @@ pub async fn monitor(
             _ = stop.changed() => {},
         }
     };
-    // Recording completion (and application exit) includes all queued remuxes.
-    while jobs.join_next().await.is_some() {}
+    // Output observation ends immediately; registered conversions keep their own
+    // lifecycle guard so exit still waits, without holding up the next capture.
     failure.map_or(Ok(()), Err)
 }
 
-pub async fn finish_segments(app: &AppHandle, task_id: i64, status: &str) -> Result<(), String> {
+pub async fn finish_segments(
+    app: &AppHandle,
+    task_id: i64,
+    status: &str,
+    work: Option<std::sync::Arc<crate::lifecycle::Operation>>,
+) -> Result<(), String> {
     let state = app.state::<crate::AppState>();
     let ids = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -97,7 +100,7 @@ pub async fn finish_segments(app: &AppHandle, task_id: i64, status: &str) -> Res
                     .map_err(|e| e.to_string())?;
             }
             let updated = db.get_segment(segment.id).map_err(|e| e.to_string())?;
-            if crate::settings::load_settings().auto_convert_mp4
+            if state.settings().auto_convert_mp4
                 && updated.status == "completed"
                 && updated.conversion_state == "idle"
                 && db
@@ -112,7 +115,18 @@ pub async fn finish_segments(app: &AppHandle, task_id: i64, status: &str) -> Res
     emit_segments(app, task_id)?;
     for id in ids {
         // Individual conversion failures remain visible on the segment and do not stop recording.
-        let _ = crate::conversion::convert_claimed_segment(app.clone(), id).await;
+        if let Some(work) = &work {
+            queue_conversion(app.clone(), id, work.clone());
+        } else {
+            let _ = crate::conversion::convert_claimed_segment(app.clone(), id).await;
+        }
     }
     Ok(())
+}
+
+fn queue_conversion(app: AppHandle, id: i64, work: std::sync::Arc<crate::lifecycle::Operation>) {
+    tokio::spawn(async move {
+        let _work = work;
+        let _ = crate::conversion::convert_claimed_segment(app, id).await;
+    });
 }

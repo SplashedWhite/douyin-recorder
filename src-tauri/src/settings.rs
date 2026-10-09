@@ -43,6 +43,13 @@ pub struct AppSettings {
     pub auto_convert_mp4: bool,
     pub segment_recording_enabled: bool,
     pub segment_duration_minutes: u32,
+    pub ffmpeg_reconnect_enabled: bool,
+    pub recording_recovery_enabled: bool,
+    pub recording_recovery_timeout_secs: u64,
+    pub ffmpeg_rw_timeout_secs: u64,
+    pub ffmpeg_reconnect_max_retries: u32,
+    pub ffmpeg_reconnect_delay_max_secs: u64,
+    pub ffmpeg_reconnect_delay_total_max_secs: u64,
     pub time_format_24h: bool,
     pub time_display_mode: String,
     pub auto_check_interval_secs: u64,
@@ -80,6 +87,13 @@ impl Default for AppSettings {
             auto_convert_mp4: false,
             segment_recording_enabled: false,
             segment_duration_minutes: 60,
+            ffmpeg_reconnect_enabled: false,
+            recording_recovery_enabled: false,
+            recording_recovery_timeout_secs: 120,
+            ffmpeg_rw_timeout_secs: 20,
+            ffmpeg_reconnect_max_retries: 5,
+            ffmpeg_reconnect_delay_max_secs: 15,
+            ffmpeg_reconnect_delay_total_max_secs: 30,
             time_format_24h: true,
             time_display_mode: "absolute".to_string(),
             auto_check_interval_secs: 60,
@@ -133,6 +147,10 @@ pub fn load_settings_from(path: &Path) -> Result<AppSettings, String> {
 }
 
 pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), String> {
+    if !(10..=3600).contains(&settings.recording_recovery_timeout_secs) {
+        return Err("最长恢复时间必须为 10 到 3600 秒的整数".into());
+    }
+    settings.validate_ffmpeg()?;
     if !(1..=MAX_LOG_SIZE_MIB).contains(&settings.api_log_max_size_mib) {
         return Err(format!(
             "单个接口日志大小必须在 1 到 {MAX_LOG_SIZE_MIB} MiB 之间"
@@ -184,9 +202,97 @@ pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), Strin
     Ok(())
 }
 
+impl AppSettings {
+    pub fn validate_ffmpeg(&self) -> Result<(), String> {
+        for (label, value) in [
+            ("网络读写超时", self.ffmpeg_rw_timeout_secs),
+            ("单次重连等待阈值", self.ffmpeg_reconnect_delay_max_secs),
+            (
+                "累计重连等待阈值",
+                self.ffmpeg_reconnect_delay_total_max_secs,
+            ),
+        ] {
+            if !(1..=3600).contains(&value) {
+                return Err(format!("{label}必须在 1 到 3600 秒之间"));
+            }
+        }
+        if !(1..=100).contains(&self.ffmpeg_reconnect_max_retries) {
+            return Err("重连次数限制必须在 1 到 100 次之间".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{load_settings_from, save_settings_at, AppSettings};
+
+    #[test]
+    fn recovery_defaults_save_reload_and_invalid_save_are_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"quality":"HD1"}"#).unwrap();
+        let mut settings = load_settings_from(&path).unwrap();
+        assert!(!settings.recording_recovery_enabled);
+        assert_eq!(settings.recording_recovery_timeout_secs, 120);
+        settings.recording_recovery_enabled = true;
+        settings.recording_recovery_timeout_secs = 15;
+        save_settings_at(&settings, &path).unwrap();
+        let loaded = load_settings_from(&path).unwrap();
+        assert!(loaded.recording_recovery_enabled);
+        assert_eq!(loaded.recording_recovery_timeout_secs, 15);
+        let original = std::fs::read(&path).unwrap();
+        for invalid in [0, 9, 3601, u64::MAX] {
+            settings.recording_recovery_timeout_secs = invalid;
+            assert!(save_settings_at(&settings, &path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        assert!(
+            serde_json::from_str::<AppSettings>(r#"{"recording_recovery_timeout_secs":10.5}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ffmpeg_settings_upgrade_persist_and_reject_invalid_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"quality":"HD1"}"#).unwrap();
+        let mut settings = load_settings_from(&path).unwrap();
+        assert!(!settings.ffmpeg_reconnect_enabled);
+        assert_eq!(settings.ffmpeg_rw_timeout_secs, 20);
+        assert_eq!(settings.ffmpeg_reconnect_max_retries, 5);
+        assert_eq!(settings.ffmpeg_reconnect_delay_max_secs, 15);
+        assert_eq!(settings.ffmpeg_reconnect_delay_total_max_secs, 30);
+        settings.ffmpeg_rw_timeout_secs = 15;
+        settings.ffmpeg_reconnect_max_retries = 3;
+        settings.ffmpeg_reconnect_delay_max_secs = 10;
+        settings.ffmpeg_reconnect_delay_total_max_secs = 25;
+        settings.ffmpeg_reconnect_enabled = true;
+        save_settings_at(&settings, &path).unwrap();
+        let loaded = load_settings_from(&path).unwrap();
+        assert!(loaded.ffmpeg_reconnect_enabled);
+        assert_eq!(loaded.ffmpeg_rw_timeout_secs, 15);
+        assert_eq!(loaded.ffmpeg_reconnect_max_retries, 3);
+        assert_eq!(loaded.ffmpeg_reconnect_delay_max_secs, 10);
+        assert_eq!(loaded.ffmpeg_reconnect_delay_total_max_secs, 25);
+        assert_eq!(loaded.quality, "HD1");
+        let original = std::fs::read(&path).unwrap();
+        for (field, invalid) in [
+            ("ffmpeg_rw_timeout_secs", vec![0, 3601]),
+            ("ffmpeg_reconnect_max_retries", vec![0, 101]),
+            ("ffmpeg_reconnect_delay_max_secs", vec![0, 3601]),
+            ("ffmpeg_reconnect_delay_total_max_secs", vec![0, 3601]),
+        ] {
+            for value in invalid {
+                let mut json = serde_json::to_value(&settings).unwrap();
+                json[field] = value.into();
+                let invalid: AppSettings = serde_json::from_value(json).unwrap();
+                assert!(save_settings_at(&invalid, &path).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+        }
+    }
 
     #[test]
     fn log_settings_default_roundtrip_and_invalid_saves_preserve_file() {

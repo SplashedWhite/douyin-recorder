@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { ElMessage } from 'element-plus'
 import { DEFAULT_QUALITY } from '../constants/quality'
+import { newerRecovery } from '../utils/recovery'
 import type {
   LiveRoom,
   AutoMonitorMode,
@@ -12,6 +13,7 @@ import type {
   UpdateInfo,
   RecordingStatusChanged,
   RoomAutoRecordingChanged,
+  RecordingRecovery,
 } from '../types'
 
 interface RoomRefreshResult {
@@ -24,6 +26,7 @@ interface RoomRefreshResult {
 export const useRecorderStore = defineStore('recorder', () => {
   const rooms = ref<LiveRoom[]>([])
   const tasks = ref<RecordTask[]>([])
+  const recoveries = ref<Record<number, RecordingRecovery>>({})
   const loading = ref(false)
   const isRefreshingAll = ref(false)
   const availableUpdate = ref<UpdateInfo | null>(null)
@@ -37,6 +40,13 @@ export const useRecorderStore = defineStore('recorder', () => {
     auto_convert_mp4: false,
     segment_recording_enabled: false,
     segment_duration_minutes: 60,
+    ffmpeg_reconnect_enabled: false,
+    recording_recovery_enabled: false,
+    recording_recovery_timeout_secs: 120,
+    ffmpeg_rw_timeout_secs: 20,
+    ffmpeg_reconnect_max_retries: 5,
+    ffmpeg_reconnect_delay_max_secs: 15,
+    ffmpeg_reconnect_delay_total_max_secs: 30,
     time_format_24h: true,
     time_display_mode: 'absolute',
     auto_check_interval_secs: 60,
@@ -51,6 +61,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   })
   let unlistenRecordingStatus: UnlistenFn | null = null
   let unlistenSegments: UnlistenFn | null = null
+  let unlistenRecovery: UnlistenFn | null = null
   let unlistenAutoRecordingStatus: UnlistenFn | null = null
   let refreshAllPromise: Promise<RoomRefreshResult> | null = null
 
@@ -74,6 +85,22 @@ export const useRecorderStore = defineStore('recorder', () => {
   }
 
   async function listenRecordingEvents() {
+    if (!unlistenRecovery) {
+      unlistenRecovery = await listen<RecordingRecovery>('recording-recovery-changed', ({ payload }) => {
+        const previous = recoveries.value[payload.room_id]
+        if (!newerRecovery(previous, payload)) return
+        if (payload.media_received && ['recording', 'stable'].includes(payload.phase) &&
+          (!previous?.media_received || previous.task_id !== payload.task_id)) {
+          ElMessage.success('断流恢复成功，已收到媒体数据，正在保存到新文件')
+        }
+        recoveries.value[payload.room_id] = payload
+        if (['exhausted', 'failed'].includes(payload.phase)) ElMessage.warning(`断流恢复已结束：${payload.last_error || '无法继续录制'}`)
+      })
+      // Subscribe before the snapshot so a slow response cannot overwrite newer events.
+      for (const status of await invoke<RecordingRecovery[]>('get_recording_recoveries')) {
+        if (newerRecovery(recoveries.value[status.room_id], status)) recoveries.value[status.room_id] = status
+      }
+    }
     if (!unlistenSegments) {
       unlistenSegments = await listen<RecordTask>('recording-segments-changed', ({ payload }) => upsertTask(payload))
     }
@@ -111,6 +138,8 @@ export const useRecorderStore = defineStore('recorder', () => {
   }
 
   function stopListeningRecordingEvents() {
+    unlistenRecovery?.()
+    unlistenRecovery = null
     unlistenSegments?.()
     unlistenSegments = null
     unlistenRecordingStatus?.()
@@ -285,6 +314,13 @@ export const useRecorderStore = defineStore('recorder', () => {
     }
   }
 
+  async function cancelRecovery(roomId: number) {
+    const recovery = recoveries.value[roomId]
+    if (!recovery) return
+    const cancelled = await invoke<boolean>('cancel_recording_recovery', { roomId, recoveryId: recovery.recovery_id })
+    if (cancelled) ElMessage.info('已停止本轮恢复，监控和定时设置保留；稍后可能再次自动录制')
+  }
+
   async function convertSegmentToMp4(segmentId: number): Promise<string> {
     return invoke<string>('convert_segment_to_mp4', { segmentId })
   }
@@ -336,7 +372,7 @@ export const useRecorderStore = defineStore('recorder', () => {
   }
 
   return {
-    rooms, tasks, loading, isRefreshingAll, settings, availableUpdate,
+    rooms, tasks, recoveries, cancelRecovery, loading, isRefreshingAll, settings, availableUpdate,
     listenRecordingEvents, stopListeningRecordingEvents,
     loadRooms, addRoom, refreshRoom, refreshAllRooms, setRoomAutoRecord, setRoomAutoSchedule, setRoomAutoConfig,
     deleteRoom, getRoomTaskCount,

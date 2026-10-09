@@ -34,6 +34,7 @@ pub struct RecordTask {
     pub file_path: Option<String>,
     pub file_size: Option<i64>,
     pub trigger: String,
+    pub recovery_from_task_id: Option<i64>,
     pub segment_output: Option<crate::segments::SegmentOutput>,
     pub segments: Vec<crate::segments::RecordSegment>,
 }
@@ -247,6 +248,19 @@ impl Database {
             [],
         );
 
+        let columns = self
+            .conn
+            .prepare("PRAGMA table_info(record_tasks)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?;
+        if !columns.iter().any(|name| name == "recovery_from_task_id") {
+            // A diagnostic link, deliberately without a foreign key: deleting an old
+            // history item must not delete or invalidate the recovered recording.
+            self.conn.execute(
+                "ALTER TABLE record_tasks ADD COLUMN recovery_from_task_id INTEGER",
+                [],
+            )?;
+        }
         self.init_segments()?;
 
         Ok(())
@@ -443,7 +457,7 @@ impl Database {
 
     pub fn get_all_tasks(&self) -> Result<Vec<RecordTask>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, room_id, status, start_time, end_time, file_path, file_size, trigger FROM record_tasks ORDER BY id DESC"
+            "SELECT id, room_id, status, start_time, end_time, file_path, file_size, trigger, recovery_from_task_id FROM record_tasks ORDER BY id DESC"
         )?;
 
         let tasks = stmt
@@ -457,6 +471,7 @@ impl Database {
                     file_path: row.get(5)?,
                     file_size: row.get(6)?,
                     trigger: row.get(7)?,
+                    recovery_from_task_id: row.get(8)?,
                     segment_output: self.get_segment_output(row.get(0)?)?,
                     segments: self.get_segments(row.get(0)?)?,
                 })
@@ -468,7 +483,7 @@ impl Database {
 
     pub fn get_task(&self, id: i64) -> Result<RecordTask> {
         self.conn.query_row(
-            "SELECT id, room_id, status, start_time, end_time, file_path, file_size, trigger FROM record_tasks WHERE id = ?1",
+            "SELECT id, room_id, status, start_time, end_time, file_path, file_size, trigger, recovery_from_task_id FROM record_tasks WHERE id = ?1",
             [id],
             |row| {
                 Ok(RecordTask {
@@ -480,6 +495,7 @@ impl Database {
                     file_path: row.get(5)?,
                     file_size: row.get(6)?,
                     trigger: row.get(7)?,
+                    recovery_from_task_id: row.get(8)?,
                     segment_output: self.get_segment_output(row.get(0)?)?,
                     segments: self.get_segments(row.get(0)?)?,
                 })
@@ -493,6 +509,22 @@ impl Database {
             rusqlite::params![room_id, trigger],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn link_recovery(&self, task_id: i64, previous: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE record_tasks SET recovery_from_task_id = ?1 WHERE id = ?2",
+            [previous, task_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_capturing_tasks_for_room(&self, room_id: i64) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM record_tasks WHERE room_id = ?1 AND status = 'recording')",
+            [room_id],
+            |row| row.get(0),
+        )
     }
 
     pub fn update_task_status(&self, id: i64, status: &str) -> Result<()> {
@@ -707,6 +739,33 @@ mod tests {
         let _ = std::fs::remove_file(recording_path);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_dir(temp_dir);
+    }
+
+    #[test]
+    fn recovery_history_upgrades_idempotently_and_survives_predecessor_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let db = Database::new(&path).unwrap();
+        let room = db
+            .add_room_full("douyin", "123", "anchor", "title", "", "", true)
+            .unwrap();
+        let previous = db.add_task(room, "manual").unwrap();
+        db.finish_task(previous, "interrupted", Some("original.flv"), 100)
+            .unwrap();
+        let recovered = db.add_task(room, "manual").unwrap();
+        db.link_recovery(recovered, previous).unwrap();
+        db.finish_task(recovered, "completed", Some("new.flv"), 200)
+            .unwrap();
+        db.delete_task(previous).unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let db = Database::new(&path).unwrap();
+            let task = db.get_task(recovered).unwrap();
+            assert_eq!(task.recovery_from_task_id, Some(previous));
+            assert_eq!(task.file_path.as_deref(), Some("new.flv"));
+            assert_eq!(task.trigger, "manual");
+            assert_eq!(db.get_all_tasks().unwrap().len(), 1);
+        }
     }
 
     #[test]

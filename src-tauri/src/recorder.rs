@@ -15,7 +15,7 @@ const STDERR_TAIL_LINES: usize = 50;
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RecordingExit {
     pub manually_stopped: bool,
     pub status_success: bool,
@@ -94,6 +94,53 @@ struct ActiveRecording {
     stop_tx: Option<oneshot::Sender<()>>,
     completion_rx: watch::Receiver<Option<Result<(), String>>>,
     stopped_for_exit: bool,
+    stop_requested: bool,
+    progress: Arc<Mutex<MediaProgress>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MediaProgress {
+    started: tokio::time::Instant,
+    ended: Option<tokio::time::Instant>,
+    first_us: Option<u64>,
+    latest_us: u64,
+}
+
+impl Default for MediaProgress {
+    fn default() -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            ended: None,
+            first_us: None,
+            latest_us: 0,
+        }
+    }
+}
+
+impl MediaProgress {
+    fn observe(&mut self, time_us: u64) {
+        self.first_us.get_or_insert(time_us);
+        self.latest_us = self.latest_us.max(time_us);
+    }
+    pub fn has_media(&self) -> bool {
+        self.latest_us > 0
+    }
+    pub fn stable(&self) -> bool {
+        self.ended
+            .unwrap_or_else(tokio::time::Instant::now)
+            .duration_since(self.started)
+            >= Duration::from_secs(60)
+            && self
+                .first_us
+                .is_some_and(|first| self.latest_us.saturating_sub(first) >= 60_000_000)
+    }
+    pub fn running(&self) -> bool {
+        self.ended.is_none()
+    }
+
+    pub fn exited_at(&self) -> Option<tokio::time::Instant> {
+        self.ended
+    }
 }
 
 pub struct Completion {
@@ -144,17 +191,48 @@ impl Recorder {
         F: FnOnce(RecordingExit) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
-        self.start_record_with_segments(task_id, stream_url, output_path, proxy, None, on_exit)
+        let settings = crate::settings::AppSettings {
+            proxy: proxy.to_string(),
+            ..Default::default()
+        };
+        self.start_record_with_segments(task_id, stream_url, output_path, &settings, None, on_exit)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn start_record_with_segments<F, Fut>(
         &self,
         task_id: i64,
         stream_url: &str,
         output_path: &str,
-        proxy: &str,
+        settings: &crate::settings::AppSettings,
         segments: Option<&crate::segments::SegmentOutput>,
+        on_exit: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(RecordingExit) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.start_record_before(
+            task_id,
+            stream_url,
+            output_path,
+            settings,
+            segments,
+            None,
+            on_exit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_record_before<F, Fut>(
+        &self,
+        task_id: i64,
+        stream_url: &str,
+        output_path: &str,
+        settings: &crate::settings::AppSettings,
+        segments: Option<&crate::segments::SegmentOutput>,
+        deadline: Option<tokio::time::Instant>,
         on_exit: F,
     ) -> Result<(), String>
     where
@@ -164,6 +242,7 @@ impl Recorder {
         if stream_url.is_empty() {
             return Err("直播流地址为空，主播可能未开播".to_string());
         }
+        settings.validate_ffmpeg()?;
 
         if self.is_active(task_id) {
             return Err("该录制任务已经在运行".to_string());
@@ -180,13 +259,40 @@ impl Recorder {
             "-loglevel",
             "warning",
             "-nostats",
-            "-rw_timeout",
-            "60000000",
-            "-i",
-            stream_url,
-            "-c",
-            "copy",
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "1",
         ]);
+        cmd.arg("-rw_timeout")
+            .arg((settings.ffmpeg_rw_timeout_secs * 1_000_000).to_string());
+        // HTTP options must precede -i; local files and other protocols do not
+        // accept them. Each process uses the settings snapshot from its start.
+        let is_http = reqwest::Url::parse(stream_url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+        if settings.ffmpeg_reconnect_enabled && is_http {
+            cmd.args([
+                "-reconnect",
+                "1",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_on_network_error",
+                "1",
+                "-reconnect_on_http_error",
+                "500,502,503,504",
+                "-reconnect_at_eof",
+                "0",
+                "-respect_retry_after",
+                "1",
+            ])
+            .arg("-reconnect_max_retries")
+            .arg(settings.ffmpeg_reconnect_max_retries.to_string())
+            .arg("-reconnect_delay_max")
+            .arg(settings.ffmpeg_reconnect_delay_max_secs.to_string())
+            .arg("-reconnect_delay_total_max")
+            .arg(settings.ffmpeg_reconnect_delay_total_max_secs.to_string());
+        }
+        cmd.args(["-i", stream_url, "-c", "copy"]);
         if let Some(segments) = segments {
             cmd.args(["-f", "segment", "-segment_format", "flv", "-segment_time"])
                 .arg(segments.duration_secs.to_string())
@@ -205,18 +311,21 @@ impl Recorder {
             cmd.args(["-f", "flv", output_path]);
         }
         cmd.stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
         #[cfg(windows)]
         cmd.as_std_mut().creation_flags(0x08000000); // CREATE_NO_WINDOW
 
-        if !proxy.is_empty() {
-            cmd.env("http_proxy", proxy);
-            cmd.env("https_proxy", proxy);
+        if !settings.proxy.is_empty() {
+            cmd.env("http_proxy", &settings.proxy);
+            cmd.env("https_proxy", &settings.proxy);
         }
 
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err("已到最长恢复时间，未启动新进程".into());
+        }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "ffmpeg 未找到".to_string()
@@ -227,6 +336,21 @@ impl Recorder {
         // Child::wait closes child.stdin, even when used in select!. Keep it separately
         // so a later stop request can still ask FFmpeg to finalize its output.
         let stdin = child.stdin.take();
+        let progress = Arc::new(Mutex::new(MediaProgress::default()));
+        let progress_reader = progress.clone();
+        let progress_task = child.stdout.take().map(|stdout| {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(time) = line
+                        .strip_prefix("out_time_us=")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        progress_reader.lock().unwrap().observe(time);
+                    }
+                }
+            })
+        });
 
         let stderr_task = child
             .stderr
@@ -244,6 +368,8 @@ impl Recorder {
                     stop_tx: Some(stop_tx),
                     completion_rx,
                     stopped_for_exit: false,
+                    stop_requested: false,
+                    progress: progress.clone(),
                 },
             );
         }
@@ -255,6 +381,10 @@ impl Recorder {
                 result = child.wait() => RecordingExit::from_status(result, false),
                 _ = &mut stop_rx => stop_ffmpeg(&mut child, stdin, GRACEFUL_STOP_TIMEOUT).await,
             };
+            progress.lock().unwrap().ended = Some(tokio::time::Instant::now());
+            if let Some(reader) = progress_task {
+                let _ = reader.await;
+            }
 
             if let Some(stderr_task) = stderr_task {
                 exit.stderr_tail = stderr_task
@@ -279,6 +409,7 @@ impl Recorder {
             let Some(recording) = records.get_mut(&task_id) else {
                 return Ok(false);
             };
+            recording.stop_requested = true;
             (recording.stop_tx.take(), recording.completion_rx.clone())
         };
 
@@ -301,6 +432,31 @@ impl Recorder {
         .map_err(|_| "等待录制进程停止超时".to_string())??;
 
         Ok(true)
+    }
+
+    pub fn progress(&self, task_id: i64) -> Option<MediaProgress> {
+        self.active_records
+            .lock()
+            .ok()?
+            .get(&task_id)
+            .map(|record| record.progress.lock().unwrap().clone())
+    }
+
+    pub fn request_stop(&self, task_id: i64) {
+        if let Some(record) = self.active_records.lock().unwrap().get_mut(&task_id) {
+            record.stop_requested = true;
+            if let Some(sender) = record.stop_tx.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    pub fn stop_requested(&self, task_id: i64) -> bool {
+        self.active_records
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .is_some_and(|record| record.stop_requested)
     }
 
     pub fn has_active_records(&self) -> Result<bool, String> {
@@ -425,6 +581,23 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::process::Command;
 
+    #[test]
+    fn stable_progress_requires_wall_time_and_media_advancement_not_headers_or_start() {
+        let mut progress = super::MediaProgress::default();
+        progress.started -= Duration::from_secs(65);
+        assert!(!progress.has_media());
+        assert!(!progress.stable());
+        progress.observe(90_000_000); // The first timestamp can start far from zero.
+        assert!(progress.has_media());
+        assert!(!progress.stable());
+        progress.observe(149_999_999);
+        assert!(!progress.stable());
+        progress.observe(150_000_000);
+        assert!(progress.stable());
+        progress.started = tokio::time::Instant::now();
+        assert!(!progress.stable()); // A fast downloaded file cannot reset the budget.
+    }
+
     fn bundled_ffmpeg() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("binaries")
@@ -437,6 +610,225 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_reconnect_handles_transient_status_and_resumable_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("fixture.flv");
+        let output = dir.path().join("recovered.flv");
+        let mut generator = Command::new(bundled_ffmpeg());
+        generator
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=160x90:r=10",
+                "-t",
+                "4",
+                "-c:v",
+                "flv",
+                "-f",
+                "flv",
+            ])
+            .arg(&input)
+            .kill_on_drop(true);
+        generator.as_std_mut().creation_flags(0x08000000);
+        assert!(generator.output().await.unwrap().status.success());
+        let media = std::fs::read(input).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/live.flv", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let split = media.len() / 2;
+            for attempt in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                if attempt == 0 {
+                    socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    // Resumable HTTP source: intentionally break within a video
+                    // packet, then serve exactly the requested remaining bytes.
+                    // A server that resets the whole media stream is a different
+                    // case and cannot be repaired by HTTP retry options alone.
+                    let (header, bytes) = if attempt == 1 {
+                        (format!("HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Type: video/x-flv\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", media.len()), &media[..split])
+                    } else {
+                        assert!(
+                            request.contains(&format!("Range: bytes={split}-")),
+                            "{request}"
+                        );
+                        (format!("HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Type: video/x-flv\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", split, media.len() - 1, media.len(), media.len() - split), &media[split..])
+                    };
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                    socket.write_all(bytes).await.unwrap();
+                }
+            }
+        });
+        let recorder = Recorder::new(bundled_ffmpeg().to_string_lossy().into_owned());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        recorder
+            .start_record_with_segments(
+                80,
+                &url,
+                output.to_str().unwrap(),
+                &crate::settings::AppSettings {
+                    ffmpeg_reconnect_enabled: true,
+                    ..Default::default()
+                },
+                None,
+                move |exit| async move {
+                    let _ = sender.send(exit);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(15), receiver).await;
+        if result.is_err() {
+            let _ = recorder.stop_record(80).await;
+            server.abort();
+        }
+        let exit = result.expect("reconnection must finish").unwrap();
+        assert!(exit.status_success, "{exit:?}");
+        // Three completed server requests prove both retries occurred; the
+        // bounded stderr tail may have dropped early reconnect messages.
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut decoder = Command::new(bundled_ffmpeg());
+        decoder
+            .args(["-v", "error", "-xerror", "-i"])
+            .arg(&output)
+            .args(["-f", "null", "-"])
+            .kill_on_drop(true);
+        decoder.as_std_mut().creation_flags(0x08000000);
+        let decoded = decoder.output().await.unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        assert!(std::fs::metadata(output).unwrap().len() > 1024);
+    }
+
+    #[tokio::test]
+    async fn http_retry_count_opt_out_and_non_retryable_statuses() {
+        for (enabled, status, expected) in [
+            (true, 503, 3),
+            (false, 503, 1),
+            (true, 403, 1),
+            (true, 429, 1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/live.flv", listener.local_addr().unwrap());
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = count.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    read_http_request(&mut socket).await;
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = format!(
+                        "HTTP/1.1 {status} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            });
+            let settings = crate::settings::AppSettings {
+                ffmpeg_reconnect_enabled: enabled,
+                ffmpeg_reconnect_max_retries: 2,
+                ffmpeg_rw_timeout_secs: 1,
+                ..Default::default()
+            };
+            let recorder = Recorder::new(bundled_ffmpeg().to_string_lossy().into_owned());
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            recorder
+                .start_record_with_segments(
+                    81,
+                    &url,
+                    dir.path().join("failed.flv").to_str().unwrap(),
+                    &settings,
+                    None,
+                    move |exit| async move {
+                        let _ = sender.send(exit);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(10), receiver).await;
+            server.abort();
+            if result.is_err() {
+                let _ = recorder.stop_record(81).await;
+            }
+            let exit = result.expect("retry limit must end failed input").unwrap();
+            assert!(!exit.manually_stopped);
+            assert!(!exit.status_success);
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::SeqCst),
+                expected,
+                "enabled={enabled}, status={status}, {exit:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_stop_ends_a_reconnecting_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/live.flv", listener.local_addr().unwrap());
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = count.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_http_request(&mut socket).await;
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+            }
+        });
+        let recorder = Recorder::new(bundled_ffmpeg().to_string_lossy().into_owned());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        recorder
+            .start_record_with_segments(
+                82,
+                &url,
+                dir.path().join("stopped.flv").to_str().unwrap(),
+                &crate::settings::AppSettings {
+                    ffmpeg_reconnect_enabled: true,
+                    ..Default::default()
+                },
+                None,
+                move |exit| async move {
+                    let _ = sender.send(exit);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while count.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let stopped = tokio::time::timeout(Duration::from_secs(13), recorder.stop_record(82)).await;
+        server.abort();
+        ready.expect("FFmpeg must reach a retry before stopping");
+        assert!(stopped.expect("stop must remain bounded").unwrap());
+        let exit = receiver.await.unwrap();
+        assert!(exit.manually_stopped, "{exit:?}");
+        assert!(!recorder.is_active(82));
     }
 
     #[tokio::test]
@@ -557,6 +949,10 @@ mod tests {
                     stop_tx: Some(stop_tx),
                     completion_rx: complete_rx,
                     stopped_for_exit: false,
+                    stop_requested: false,
+                    progress: std::sync::Arc::new(std::sync::Mutex::new(
+                        super::MediaProgress::default(),
+                    )),
                 },
             );
             stops.push(stop_rx);
@@ -869,6 +1265,10 @@ mod tests {
                 stop_tx: None,
                 completion_rx,
                 stopped_for_exit: false,
+                stop_requested: false,
+                progress: std::sync::Arc::new(std::sync::Mutex::new(
+                    super::MediaProgress::default(),
+                )),
             },
         );
         let state = AppState {
@@ -876,6 +1276,9 @@ mod tests {
             recorder,
             parser: DouyinParser::new(),
             auto_recorder: AutoRecorder::new(),
+            recoveries: crate::recovery::Recoveries::default(),
+            #[cfg(test)]
+            test_settings: None,
             start_lock: tokio::sync::Mutex::new(()),
             lifecycle: Default::default(),
         };
@@ -974,7 +1377,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "takes about 60 seconds to verify the configured read timeout"]
     async fn ends_stalled_http_input_after_read_timeout() {
         let ffmpeg = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("binaries")
@@ -983,11 +1385,13 @@ mod tests {
             return;
         }
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stalled server");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled server");
         let address = listener.local_addr().expect("read stalled server address");
-        let _server = std::thread::spawn(move || {
-            if let Ok((_socket, _)) = listener.accept() {
-                std::thread::sleep(Duration::from_secs(70));
+        let server = tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                std::future::pending::<()>().await;
             }
         });
 
@@ -1004,12 +1408,18 @@ mod tests {
         let recorder = Recorder::new(ffmpeg.to_string_lossy().to_string());
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         let started_at = std::time::Instant::now();
+        let settings = crate::settings::AppSettings {
+            ffmpeg_rw_timeout_secs: 1,
+            ffmpeg_reconnect_enabled: false,
+            ..Default::default()
+        };
         recorder
-            .start_record(
+            .start_record_with_segments(
                 43,
                 &input_url,
                 output_path.to_str().expect("output path is utf-8"),
-                "",
+                &settings,
+                None,
                 move |exit| async move {
                     let _ = exit_tx.send(exit);
                     Ok(())
@@ -1017,14 +1427,18 @@ mod tests {
             )
             .expect("start stalled recording");
 
-        let exit = tokio::time::timeout(Duration::from_secs(75), exit_rx)
-            .await
+        let result = tokio::time::timeout(Duration::from_secs(8), exit_rx).await;
+        server.abort();
+        if result.is_err() {
+            let _ = recorder.stop_record(43).await;
+        }
+        let exit = result
             .expect("stalled ffmpeg did not honor read timeout")
             .expect("recording exit callback dropped");
         let elapsed = started_at.elapsed();
         assert!(!exit.manually_stopped);
-        assert!(elapsed >= Duration::from_secs(55));
-        assert!(elapsed < Duration::from_secs(75));
+        assert!(elapsed >= Duration::from_secs(1));
+        assert!(elapsed < Duration::from_secs(8));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!recorder.is_active(43));

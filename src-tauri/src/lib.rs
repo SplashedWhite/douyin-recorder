@@ -1,3 +1,10 @@
+// Desktop entry points are intentionally not launched by the headless tests.
+#![cfg_attr(test, allow(dead_code))]
+
+#[cfg(all(test, windows))]
+#[link(name = "resource", kind = "static")]
+unsafe extern "C" {}
+
 mod auto_policy;
 mod auto_recorder;
 mod conversion;
@@ -8,6 +15,8 @@ mod migration;
 mod parser;
 mod recorder;
 mod recording_log;
+mod recovery;
+mod recovery_runtime;
 mod segment_runtime;
 mod segment_store;
 #[cfg(all(test, windows))]
@@ -30,33 +39,46 @@ use serde_json::json;
 use settings::AppSettings;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(not(test))]
+use tauri::AppHandle;
+use tauri::{Emitter, Manager, State};
+#[cfg(test)]
+type AppHandle = tauri::AppHandle<tauri::test::MockRuntime>;
+#[cfg(all(test, windows))]
+mod recovery_tests;
 use tokio::sync::Mutex as AsyncMutex;
 
 fn resolve_ffmpeg_path() -> String {
-    let ext = if cfg!(windows) { ".exe" } else { "" };
-    let target = if cfg!(target_os = "windows") {
-        format!("{}-pc-windows-msvc", std::env::consts::ARCH)
-    } else if cfg!(target_os = "macos") {
-        format!("{}-apple-darwin", std::env::consts::ARCH)
-    } else {
-        format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
-    };
-    let sidecar_name = format!("ffmpeg-{}{}", target, ext);
+    #[cfg(all(test, windows))]
+    {
+        return segment_tests::ffmpeg().to_string_lossy().into_owned();
+    }
+    #[cfg(not(all(test, windows)))]
+    {
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        let target = if cfg!(target_os = "windows") {
+            format!("{}-pc-windows-msvc", std::env::consts::ARCH)
+        } else if cfg!(target_os = "macos") {
+            format!("{}-apple-darwin", std::env::consts::ARCH)
+        } else {
+            format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
+        };
+        let sidecar_name = format!("ffmpeg-{}{}", target, ext);
 
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let sidecar_path = exe_dir.join(&sidecar_name);
-            if sidecar_path.exists() {
-                return sidecar_path.to_string_lossy().to_string();
-            }
-            let resource_sidecar = exe_dir.join("resources").join(&sidecar_name);
-            if resource_sidecar.exists() {
-                return resource_sidecar.to_string_lossy().to_string();
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let sidecar_path = exe_dir.join(&sidecar_name);
+                if sidecar_path.exists() {
+                    return sidecar_path.to_string_lossy().to_string();
+                }
+                let resource_sidecar = exe_dir.join("resources").join(&sidecar_name);
+                if resource_sidecar.exists() {
+                    return resource_sidecar.to_string_lossy().to_string();
+                }
             }
         }
+        "ffmpeg".to_string()
     }
-    "ffmpeg".to_string()
 }
 
 struct AppState {
@@ -64,8 +86,21 @@ struct AppState {
     recorder: Recorder,
     parser: DouyinParser,
     auto_recorder: AutoRecorder,
+    recoveries: recovery::Recoveries,
     start_lock: AsyncMutex<()>,
     lifecycle: Arc<lifecycle::Lifecycle>,
+    #[cfg(test)]
+    test_settings: Option<AppSettings>,
+}
+
+impl AppState {
+    fn settings(&self) -> AppSettings {
+        #[cfg(test)]
+        if let Some(settings) = &self.test_settings {
+            return settings.clone();
+        }
+        settings::load_settings()
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -128,8 +163,7 @@ fn set_retry(room: &mut LiveRoom, delay: u64, message: String) {
     room.auto_record_error = Some(message);
 }
 
-fn get_recordings_dir() -> Result<String, String> {
-    let settings = settings::load_settings();
+fn get_recordings_dir(settings: &AppSettings) -> Result<String, String> {
     let dir = if settings.recordings_dir.is_empty() {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
@@ -165,6 +199,7 @@ fn emit_recording_event(
         Some(task.id),
         Some(task.room_id),
         json!({"reason": reason, "status": task.status, "trigger": task.trigger,
+            "recovery_from_task_id": task.recovery_from_task_id,
             "file_path": task.file_path, "file_size": task.file_size, "message": message}),
     );
     let _ = app.emit(
@@ -253,7 +288,7 @@ async fn refresh_room_internal(state: &AppState, room_id: i64) -> Result<LiveRoo
         let room = db.get_room(room_id).map_err(|e| e.to_string())?;
         format!("https://live.douyin.com/{}", room.room_id)
     };
-    let app_settings = settings::load_settings();
+    let app_settings = state.settings();
     let info = state
         .parser
         .parse_douyin_url(&douyin_url, &app_settings, RequestSource::ManualRefresh)
@@ -272,7 +307,7 @@ fn apply_post_recording_auto_policy(
     verification: Option<LiveVerification>,
     rate_limited: bool,
 ) -> (&'static str, Option<String>) {
-    let settings = settings::load_settings();
+    let settings = state.settings();
     let offline = matches!(verification, Some(LiveVerification::Offline));
     match auto_policy::post_record_action(
         room,
@@ -351,6 +386,19 @@ async fn handle_recording_exit(
     room_id: i64,
     exit: RecordingExit,
 ) -> Result<(), String> {
+    finalize_recording_exit(app, task_id, room_id, exit, None, true, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_recording_exit(
+    app: AppHandle,
+    task_id: i64,
+    room_id: i64,
+    exit: RecordingExit,
+    verified: Option<(LiveVerification, bool, Option<String>)>,
+    apply_policy: bool,
+    work: Option<Arc<lifecycle::Operation>>,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
     let (original_path, original_size, task_trigger, finalizing_task) = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -372,65 +420,69 @@ async fn handle_recording_exit(
     let segmented = finalizing_task.segment_output.is_some();
     emit_recording_event(&app, finalizing_task, None, "finalizing", None);
     let mut rate_limited = false;
-    let (verification, verification_message) = if exit.manually_stopped {
-        (None, None)
-    } else {
-        let room = {
-            let db = state.db.lock().map_err(|e| e.to_string())?;
-            db.get_room(room_id).map_err(|e| e.to_string())?
-        };
-        let url = format!("https://live.douyin.com/{}", room.room_id);
-        let result = state
-            .parser
-            .parse_douyin_url(
-                &url,
-                &settings::load_settings(),
-                RequestSource::RecordingVerification,
-            )
-            .await;
-        match result {
-            Ok(info) => {
-                if let Some(logger) = recording_log::logger() {
-                    logger.live_verification(
-                        task_id,
-                        room_id,
-                        Some(if info.is_live {
-                            LiveVerification::Live
-                        } else {
-                            LiveVerification::Offline
-                        }),
-                        false,
-                        None,
-                    );
-                }
-                apply_live_info(&state, room_id, &info)?;
-                if info.is_live {
-                    (
-                        Some(LiveVerification::Live),
-                        Some("录制进程已结束，但主播仍在直播".to_string()),
-                    )
-                } else {
-                    (Some(LiveVerification::Offline), None)
-                }
-            }
-            Err(error) => {
-                rate_limited = error.is_rate_limited();
-                if let Some(logger) = recording_log::logger() {
-                    logger.live_verification(
-                        task_id,
-                        room_id,
-                        Some(LiveVerification::Failed),
-                        rate_limited,
-                        Some(error.to_string()),
-                    );
-                }
-                (
-                    Some(LiveVerification::Failed),
-                    Some(format!("录制进程已结束，但无法确认直播状态: {}", error)),
+    let (verification, verification_message) =
+        if let Some((verification, limited, message)) = verified {
+            rate_limited = limited;
+            (Some(verification), message)
+        } else if exit.manually_stopped {
+            (None, None)
+        } else {
+            let room = {
+                let db = state.db.lock().map_err(|e| e.to_string())?;
+                db.get_room(room_id).map_err(|e| e.to_string())?
+            };
+            let url = format!("https://live.douyin.com/{}", room.room_id);
+            let result = state
+                .parser
+                .parse_douyin_url(
+                    &url,
+                    &state.settings(),
+                    RequestSource::RecordingVerification,
                 )
+                .await;
+            match result {
+                Ok(info) => {
+                    if let Some(logger) = recording_log::logger() {
+                        logger.live_verification(
+                            task_id,
+                            room_id,
+                            Some(if info.is_live {
+                                LiveVerification::Live
+                            } else {
+                                LiveVerification::Offline
+                            }),
+                            false,
+                            None,
+                        );
+                    }
+                    apply_live_info(&state, room_id, &info)?;
+                    if info.is_live {
+                        (
+                            Some(LiveVerification::Live),
+                            Some("录制进程已结束，但主播仍在直播".to_string()),
+                        )
+                    } else {
+                        (Some(LiveVerification::Offline), None)
+                    }
+                }
+                Err(error) => {
+                    rate_limited = error.is_rate_limited();
+                    if let Some(logger) = recording_log::logger() {
+                        logger.live_verification(
+                            task_id,
+                            room_id,
+                            Some(LiveVerification::Failed),
+                            rate_limited,
+                            Some(error.to_string()),
+                        );
+                    }
+                    (
+                        Some(LiveVerification::Failed),
+                        Some(format!("录制进程已结束，但无法确认直播状态: {}", error)),
+                    )
+                }
             }
-        }
-    };
+        };
     if exit.manually_stopped {
         if let Some(logger) = recording_log::logger() {
             logger.live_verification(task_id, room_id, None, false, None);
@@ -459,7 +511,7 @@ async fn handle_recording_exit(
         _ => verification_message,
     };
     if segmented {
-        segment_runtime::finish_segments(&app, task_id, status).await?;
+        segment_runtime::finish_segments(&app, task_id, status, work).await?;
         final_size = state
             .db
             .lock()
@@ -467,7 +519,7 @@ async fn handle_recording_exit(
             .segment_total_size(task_id)
             .map_err(|e| e.to_string())?;
     } else if status == "completed"
-        && settings::load_settings().auto_convert_mp4
+        && state.settings().auto_convert_mp4
         && final_path
             .as_deref()
             .is_some_and(|path| path.ends_with(".flv"))
@@ -491,25 +543,32 @@ async fn handle_recording_exit(
     // and ticks use this same lock, so they cannot publish an obsolete room snapshot.
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
-    let (auto_reason, auto_message) =
-        if state.lifecycle.is_exiting() || state.recorder.stopped_for_exit(task_id) {
-            // Application shutdown must not consume a monitoring window or change
-            // the user's auto-record intent, even if a timed-out shutdown was cancelled.
-            ("state_changed", None)
-        } else {
-            apply_post_recording_auto_policy(
-                &state,
-                &mut room,
-                &task_trigger,
-                status,
-                &exit,
-                verification,
-                rate_limited,
-            )
-        };
-    let (final_task, room) = db
-        .finish_task_and_automation(task_id, status, final_path.as_deref(), final_size, &room)
-        .map_err(|e| e.to_string())?;
+    let (auto_reason, auto_message) = if !apply_policy
+        || state.lifecycle.is_exiting()
+        || state.recorder.stopped_for_exit(task_id)
+    {
+        // Application shutdown must not consume a monitoring window or change
+        // the user's auto-record intent, even if a timed-out shutdown was cancelled.
+        ("state_changed", None)
+    } else {
+        apply_post_recording_auto_policy(
+            &state,
+            &mut room,
+            &task_trigger,
+            status,
+            &exit,
+            verification,
+            rate_limited,
+        )
+    };
+    let (final_task, room) = if apply_policy {
+        db.finish_task_and_automation(task_id, status, final_path.as_deref(), final_size, &room)
+            .map_err(|e| e.to_string())?
+    } else {
+        db.finish_task(task_id, status, final_path.as_deref(), final_size)
+            .map_err(|e| e.to_string())?;
+        (db.get_task(task_id).map_err(|e| e.to_string())?, room)
+    };
     if final_path != original_path {
         if let Some(source) = original_path {
             if let Err(error) = std::fs::remove_file(source) {
@@ -517,21 +576,29 @@ async fn handle_recording_exit(
             }
         }
     }
-    recording_log::event(
-        "INFO",
-        "recording_auto_policy",
-        Some(task_id),
-        Some(room_id),
-        recording_log::automation_details(&room, auto_reason, auto_message.as_deref()),
-    );
-    emit_auto_recording_event(&app, room.clone(), auto_reason, auto_message);
+    if apply_policy {
+        recording_log::event(
+            "INFO",
+            "recording_auto_policy",
+            Some(task_id),
+            Some(room_id),
+            recording_log::automation_details(&room, auto_reason, auto_message.as_deref()),
+        );
+        emit_auto_recording_event(&app, room.clone(), auto_reason, auto_message);
+    }
     let reason = match status {
         "completed" if exit.manually_stopped => "manual_stop",
         "completed" => "stream_ended",
         "interrupted" => "interrupted",
         _ => "failed",
     };
-    emit_recording_event(&app, final_task, Some(room), reason, message);
+    emit_recording_event(
+        &app,
+        final_task,
+        apply_policy.then_some(room),
+        reason,
+        message,
+    );
     Ok(())
 }
 
@@ -562,7 +629,8 @@ async fn start_record_from_info(
     expected_revision: Option<i64>,
 ) -> Result<RecordTask, StartRecordError> {
     let result =
-        start_record_from_info_inner(app, state, room_id, info, trigger, expected_revision).await;
+        start_record_from_info_inner(app, state, room_id, info, trigger, expected_revision, None)
+            .await;
     if let Err(error) = &result {
         recording_log::event(
             if matches!(
@@ -589,6 +657,7 @@ async fn start_record_from_info_inner(
     info: &LiveInfo,
     trigger: &str,
     expected_revision: Option<i64>,
+    recovery: Option<(&recovery::Ticket, i64)>,
 ) -> Result<RecordTask, StartRecordError> {
     let _start_guard = state.start_lock.lock().await;
     if state.lifecycle.is_exiting() {
@@ -600,11 +669,28 @@ async fn start_record_from_info_inner(
         .lock()
         .map_err(|e| StartRecordError::Fatal(e.to_string()))?;
     let fatal = |e: rusqlite::Error| StartRecordError::Fatal(e.to_string());
-    if db.has_running_tasks_for_room(room_id).map_err(fatal)? {
+    if let Some((ticket, _)) = recovery {
+        if !ticket.usable()
+            || !state.recoveries.owns(ticket)
+            || !state.settings().recording_recovery_enabled
+        {
+            return Err(StartRecordError::Superseded);
+        }
+    } else if state.recoveries.busy(room_id) {
+        return Err(StartRecordError::AlreadyRunning);
+    }
+    if (if recovery.is_some() {
+        db.has_capturing_tasks_for_room(room_id)
+    } else {
+        db.has_running_tasks_for_room(room_id)
+    })
+    .map_err(fatal)?
+    {
         return Err(StartRecordError::AlreadyRunning);
     }
     let mut room = db.get_room(room_id).map_err(fatal)?;
-    if trigger == "auto"
+    if recovery.is_none()
+        && trigger == "auto"
         && !expected_revision
             .is_some_and(|revision| auto_policy::accepts_check(&room, revision, false, Utc::now()))
     {
@@ -615,11 +701,14 @@ async fn start_record_from_info_inner(
             "直播流地址为空，稍后重新检查".to_string(),
         ));
     }
-    let recordings_dir = get_recordings_dir().map_err(StartRecordError::Fatal)?;
+    let recordings_dir = get_recordings_dir(&state.settings()).map_err(StartRecordError::Fatal)?;
     let task_id = db.add_task(room_id, trigger).map_err(fatal)?;
+    if let Some((_, previous)) = recovery {
+        db.link_recovery(task_id, previous).map_err(fatal)?;
+    }
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     // Task id also prevents a quick retry from overwriting an earlier partial file.
-    let app_settings = settings::load_settings();
+    let app_settings = state.settings();
     let basename = format!(
         "{}_{}_{}_{}",
         segments::safe_filename(&room.anchor_name),
@@ -649,8 +738,15 @@ async fn start_record_from_info_inner(
         Some(task_id),
         Some(room_id),
         json!({"platform_room_id": room.room_id, "trigger": trigger, "mode": room.auto_monitor_mode,
+            "recovery_id": recovery.map(|(ticket, _)| ticket.id),
+            "recovery_from_task_id": recovery.map(|(_, previous)| previous),
             "quality": app_settings.quality, "segmented": segment_output.is_some(),
-            "segment_duration_minutes": app_settings.segment_duration_minutes, "output_path": output_str}),
+            "segment_duration_minutes": app_settings.segment_duration_minutes, "output_path": output_str,
+            "ffmpeg_reconnect_enabled": app_settings.ffmpeg_reconnect_enabled,
+            "ffmpeg_rw_timeout_secs": app_settings.ffmpeg_rw_timeout_secs,
+            "ffmpeg_reconnect_max_retries": app_settings.ffmpeg_reconnect_max_retries,
+            "ffmpeg_reconnect_delay_max_secs": app_settings.ffmpeg_reconnect_delay_max_secs,
+            "ffmpeg_reconnect_delay_total_max_secs": app_settings.ffmpeg_reconnect_delay_total_max_secs}),
     );
     db.update_task_status_and_path(
         task_id,
@@ -666,7 +762,7 @@ async fn start_record_from_info_inner(
         db.set_segment_output(task_id, output).map_err(fatal)?;
     }
     let exit_app = app.clone();
-    let start_result = (|| -> Result<(), String> {
+    let start_result = (|| -> Result<(RecordTask, LiveRoom), String> {
         if let Some(output) = &segment_output {
             let manifest = std::path::Path::new(&output.manifest_path);
             std::fs::create_dir_all(manifest.parent().ok_or("分段清单目录无效")?)
@@ -688,53 +784,49 @@ async fn start_record_from_info_inner(
             db.add_segment(task_id, 1, &output_str, &task.start_time)
                 .map_err(|e| e.to_string())?;
         }
+        // Finish fallible database work before spawning. Once a process exists,
+        // recovery must never mistake a metadata error for a failed launch.
+        room.auto_record_error = None;
+        room.auto_record_retry_at = None;
+        let published_room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
+        let published_task = db.get_task(task_id).map_err(|e| e.to_string())?;
         let (monitor_stop, monitor_rx) = tokio::sync::watch::channel(false);
+        let work = Arc::new(state.lifecycle.operation()?);
         let monitor = segment_output.clone().map(|output| {
             tokio::spawn(segment_runtime::monitor(
                 app.clone(),
                 task_id,
                 output,
                 monitor_rx,
+                work.clone(),
             ))
         });
         let abort = monitor.as_ref().map(|handle| handle.abort_handle());
         let stop_on_failure = monitor_stop.clone();
-        let result = state.recorder.start_record_with_segments(
+        if recovery.is_some_and(|(ticket, _)| !ticket.usable()) {
+            let _ = stop_on_failure.send(true);
+            if let Some(abort) = abort {
+                abort.abort();
+            }
+            return Err("已到最长恢复时间，未启动新进程".into());
+        }
+        let result = state.recorder.start_record_before(
             task_id,
             &info.stream_url,
             &output_str,
-            &app_settings.proxy,
+            &app_settings,
             segment_output.as_ref(),
-            move |exit| async move {
-                let mut monitor_error = None;
-                if let Some(monitor) = monitor {
-                    let _ = monitor_stop.send(true);
-                    {
-                        let state = exit_app.state::<AppState>();
-                        let db = state.db.lock().map_err(|e| e.to_string())?;
-                        db.mark_task_finalizing(
-                            task_id,
-                            db.segment_total_size(task_id).map_err(|e| e.to_string())?,
-                        )
-                        .map_err(|e| e.to_string())?;
-                        emit_recording_event(
-                            &exit_app,
-                            db.get_task(task_id).map_err(|e| e.to_string())?,
-                            None,
-                            "finalizing",
-                            None,
-                        );
-                    }
-                    if let Err(error) = monitor
-                        .await
-                        .map_err(|e| e.to_string())
-                        .and_then(|result| result)
-                    {
-                        monitor_error = Some(error);
-                    }
-                }
-                handle_recording_exit(exit_app, task_id, room_id, exit).await?;
-                monitor_error.map_or(Ok(()), Err)
+            recovery.map(|(ticket, _)| ticket.deadline),
+            move |exit| {
+                recovery_runtime::recording_exit(
+                    exit_app,
+                    task_id,
+                    room_id,
+                    exit,
+                    monitor_stop,
+                    monitor,
+                    work,
+                )
             },
         );
         if result.is_err() {
@@ -743,7 +835,7 @@ async fn start_record_from_info_inner(
                 abort.abort();
             }
         }
-        result
+        result.map(|()| (published_task, published_room))
     })();
     if let Err(error) = start_result {
         recording_log::event(
@@ -781,6 +873,7 @@ async fn start_record_from_info_inner(
         );
         return Err(StartRecordError::Fatal(error));
     }
+    let (task, room) = start_result.map_err(StartRecordError::Fatal)?;
     recording_log::event(
         "INFO",
         "recording_started",
@@ -789,11 +882,15 @@ async fn start_record_from_info_inner(
         json!({"trigger": trigger}),
     );
     state.auto_recorder.mark_recording_started(room_id);
-    room.auto_record_error = None;
-    room.auto_record_retry_at = None;
-    let room = db.save_room_automation(&room).map_err(fatal)?;
-    let task = db.get_task(task_id).map_err(fatal)?;
-    if trigger == "auto" {
+    if let Some((ticket, _)) = recovery {
+        if let Some(status) = state.recoveries.started(ticket, task_id) {
+            recovery_runtime::publish(app, status, "process_started");
+        }
+    }
+    if recovery.is_some() {
+        emit_recording_event(app, task.clone(), Some(room), "recovery_started", None);
+        recovery_runtime::watch_media(app.clone(), room_id, task_id);
+    } else if trigger == "auto" {
         emit_recording_event(
             app,
             task.clone(),
@@ -829,11 +926,12 @@ fn handle_check_error(
     let mut room = db.get_room(snapshot.id).map_err(|e| e.to_string())?;
     let running = db
         .has_running_tasks_for_room(room.id)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        || state.recoveries.busy(room.id);
     if !auto_policy::accepts_check(&room, snapshot.auto_record_revision, running, Utc::now()) {
         return Ok(());
     }
-    let settings = settings::load_settings();
+    let settings = state.settings();
     let (reason, message) = if fatal {
         auto_policy::set_enabled(
             &mut room,
@@ -869,7 +967,7 @@ async fn check_auto_room(app: &AppHandle, snapshot: LiveRoom) -> Result<(), Stri
     let Ok(_operation) = state.lifecycle.operation() else {
         return Ok(());
     };
-    let settings = settings::load_settings();
+    let settings = state.settings();
     let url = format!("https://live.douyin.com/{}", snapshot.room_id);
     let info = match state
         .parser
@@ -895,7 +993,8 @@ async fn check_auto_room(app: &AppHandle, snapshot: LiveRoom) -> Result<(), Stri
         let room = db.get_room(snapshot.id).map_err(|e| e.to_string())?;
         let running = db
             .has_running_tasks_for_room(room.id)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            || state.recoveries.busy(room.id);
         if !auto_policy::accepts_check(&room, snapshot.auto_record_revision, running, Utc::now()) {
             return Ok(());
         }
@@ -945,13 +1044,14 @@ fn process_auto_deadlines_and_schedules(app: &AppHandle) -> Result<(), String> {
     let Ok(_operation) = state.lifecycle.operation() else {
         return Ok(());
     };
-    let settings = settings::load_settings();
+    let settings = state.settings();
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let now = Local::now();
     for mut room in db.get_all_rooms().map_err(|e| e.to_string())? {
         let running = db
             .has_running_tasks_for_room(room.id)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            || state.recoveries.busy(room.id);
         let action = auto_policy::tick(&mut room, running, settings.auto_monitor_window_hours, now);
         let (reason, message) = match action {
             TickAction::None => continue,
@@ -982,7 +1082,8 @@ fn next_due_auto_room(app: &AppHandle) -> Result<Option<LiveRoom>, String> {
     for room in db.get_all_rooms().map_err(|e| e.to_string())? {
         let running = db
             .has_running_tasks_for_room(room.id)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            || state.recoveries.busy(room.id);
         let due = retry_is_due(&room, now) && state.auto_recorder.is_due(room.id);
         if should_poll_auto_room(
             room.auto_record_enabled,
@@ -1014,7 +1115,7 @@ async fn auto_record_loop(app: AppHandle) {
                     let state = app.state::<AppState>();
                     let delay = state.auto_recorder.mark_failure(
                         room_id,
-                        settings::load_settings().auto_check_interval_secs,
+                        state.settings().auto_check_interval_secs,
                         false,
                     );
                     recording_log::event(
@@ -1053,18 +1154,23 @@ fn reconcile_auto_state_on_startup(db: &Database, settings: &AppSettings) -> Res
 #[tauri::command]
 fn get_settings_cmd(state: State<AppState>) -> Result<AppSettings, String> {
     let db = state.db.lock().map_err(|e| e.to_string())?;
-    let mut current_settings = settings::load_settings();
+    let mut current_settings = state.settings();
     current_settings.db_path = db.path().to_string_lossy().to_string();
     Ok(current_settings)
 }
 
 #[tauri::command]
-fn save_settings_cmd(
-    state: State<AppState>,
+async fn save_settings_cmd(
+    app: AppHandle,
+    state: State<'_, AppState>,
     new_settings: AppSettings,
 ) -> Result<AppSettings, String> {
     let _operation = state.lifecycle.operation()?;
+    let _start = state.start_lock.lock().await;
     let saved = migration::save_settings(&state, new_settings, &settings::settings_path())?;
+    if !saved.recording_recovery_enabled {
+        recovery_runtime::cancel_all(&app, recovery::CancelReason::Settings, true);
+    }
     state.lifecycle.close_to_tray.store(
         saved.close_behavior == settings::CloseBehavior::Tray,
         Ordering::Release,
@@ -1089,7 +1195,7 @@ async fn migrate_db_cmd(app: AppHandle, new_path: String) -> Result<String, Stri
 #[tauri::command]
 async fn check_for_update(app: AppHandle) -> Result<Option<updater::UpdateInfo>, String> {
     let current_version = app.package_info().version.clone();
-    let app_settings = settings::load_settings();
+    let app_settings = app.state::<AppState>().settings();
     updater::check_for_update(&current_version, &app_settings).await
 }
 
@@ -1102,7 +1208,7 @@ fn get_rooms(state: State<AppState>) -> Result<Vec<LiveRoom>, String> {
 #[tauri::command]
 async fn add_room(state: State<'_, AppState>, url: String) -> Result<LiveRoom, String> {
     let _operation = state.lifecycle.operation()?;
-    let app_settings = settings::load_settings();
+    let app_settings = state.settings();
     let info = state
         .parser
         .parse_douyin_url(&url, &app_settings, RequestSource::AddRoom)
@@ -1130,14 +1236,23 @@ async fn refresh_room(state: State<'_, AppState>, room_id: i64) -> Result<LiveRo
 }
 
 #[tauri::command]
-fn set_room_auto_record(
+async fn set_room_auto_record(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     room_id: i64,
     enabled: bool,
 ) -> Result<LiveRoom, String> {
     let _operation = state.lifecycle.operation()?;
-    let settings = settings::load_settings();
+    let _start = state.start_lock.lock().await;
+    if !enabled
+        && state
+            .recoveries
+            .status(room_id)
+            .is_some_and(|s| s.trigger == "auto")
+    {
+        recovery_runtime::cancel(&app, room_id, None, recovery::CancelReason::Monitor, true);
+    }
+    let settings = state.settings();
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
     auto_policy::set_enabled(
@@ -1176,7 +1291,7 @@ fn save_room_auto_config(
     daily_time: Option<String>,
 ) -> Result<LiveRoom, String> {
     let _operation = state.lifecycle.operation()?;
-    let settings = settings::load_settings();
+    let settings = state.settings();
     let db = state.db.lock().map_err(|e| e.to_string())?;
     let mut room = db.get_room(room_id).map_err(|e| e.to_string())?;
     let mode = mode.unwrap_or(room.auto_monitor_mode);
@@ -1225,13 +1340,26 @@ fn get_room_task_count(state: State<AppState>, room_id: i64) -> Result<i64, Stri
 }
 
 #[tauri::command]
-fn delete_room(state: State<AppState>, id: i64, cascade: Option<bool>) -> Result<(), String> {
+async fn delete_room(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+    cascade: Option<bool>,
+) -> Result<(), String> {
     let _operation = state.lifecycle.operation()?;
     {
+        let _start = state.start_lock.lock().await;
+        recovery_runtime::cancel(&app, id, None, recovery::CancelReason::Superseded, true);
+    }
+    // A cancelled query still owns its old output until the exit callback saves it.
+    // The existing running-work guard below keeps deletion reviewable and safe.
+    let _start = state.start_lock.lock().await;
+    {
         let db = state.db.lock().map_err(|e| e.to_string())?;
-        if db
-            .has_running_tasks_for_room(id)
-            .map_err(|e| e.to_string())?
+        if state.recoveries.busy(id)
+            || db
+                .has_running_tasks_for_room(id)
+                .map_err(|e| e.to_string())?
         {
             return Err("该房间正在录制或结束处理中，请先停止录制".to_string());
         }
@@ -1256,18 +1384,67 @@ fn get_tasks(state: State<AppState>) -> Result<Vec<RecordTask>, String> {
 }
 
 #[tauri::command]
+fn get_recording_recoveries(state: State<AppState>) -> Vec<recovery::RecoveryStatus> {
+    state.recoveries.snapshot()
+}
+
+#[tauri::command]
+async fn cancel_recording_recovery(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    room_id: i64,
+    recovery_id: u64,
+) -> Result<bool, String> {
+    let _operation = state.lifecycle.operation()?;
+    let _start = state.start_lock.lock().await;
+    Ok(recovery_runtime::cancel(
+        &app,
+        room_id,
+        Some(recovery_id),
+        recovery::CancelReason::User,
+        false,
+    )
+    .is_some())
+}
+
+#[tauri::command]
 async fn start_record(
     app: AppHandle,
     state: State<'_, AppState>,
     room_id: i64,
 ) -> Result<RecordTask, String> {
     let _operation = state.lifecycle.operation()?;
+    let previous = {
+        let _start = state.start_lock.lock().await;
+        if state.recoveries.busy(room_id) {
+            if state
+                .recoveries
+                .status(room_id)
+                .is_some_and(|s| s.phase == "recording")
+            {
+                return Err("该直播间已经在录制".into());
+            }
+            recovery_runtime::cancel(
+                &app,
+                room_id,
+                None,
+                recovery::CancelReason::Superseded,
+                true,
+            )
+            .map(|s| s.task_id)
+        } else {
+            None
+        }
+    };
+    if let Some(task) = previous {
+        state.recorder.stop_record(task).await?;
+    }
     let douyin_url = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let room = db.get_room(room_id).map_err(|e| e.to_string())?;
         format!("https://live.douyin.com/{}", room.room_id)
     };
-    let app_settings = settings::load_settings();
+    let app_settings = state.settings();
     let info = state
         .parser
         .parse_douyin_url(&douyin_url, &app_settings, RequestSource::ManualStart)
@@ -1330,6 +1507,19 @@ async fn stop_record(
         let _start_guard = state.start_lock.lock().await;
         let db = state.db.lock().map_err(|e| e.to_string())?;
         let task = db.get_task(task_id).map_err(|e| e.to_string())?;
+        let stopping_chain = state.recoveries.includes_task(task.room_id, task_id);
+        // Also records intent when FFmpeg has exited but its callback is waiting
+        // for this lock and has not yet registered a recovery episode.
+        state.recorder.request_stop(task_id);
+        if stopping_chain {
+            recovery_runtime::cancel(
+                &app,
+                task.room_id,
+                None,
+                recovery::CancelReason::Stop,
+                false,
+            );
+        }
         recording_log::event(
             "INFO",
             "recording_stop_requested",
@@ -1338,7 +1528,15 @@ async fn stop_record(
             json!({"status": task.status}),
         );
         let mut room = db.get_room(task.room_id).map_err(|e| e.to_string())?;
-        if auto_policy::disable_for_manual_stop(&mut room, &task.status, Utc::now()) {
+        if auto_policy::disable_for_manual_stop(
+            &mut room,
+            if stopping_chain {
+                "recording"
+            } else {
+                &task.status
+            },
+            Utc::now(),
+        ) {
             let room = db.save_room_automation(&room).map_err(|e| e.to_string())?;
             state.auto_recorder.clear(room.id);
             emit_auto_recording_event(
@@ -1488,6 +1686,7 @@ fn delete_segment(app: AppHandle, segment_id: i64) -> Result<(), String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(not(test))]
 pub fn run() {
     tauri::Builder::default()
         // This must run before database reconciliation or any background task.
@@ -1511,6 +1710,9 @@ pub fn run() {
                 recorder: Recorder::new(resolve_ffmpeg_path()),
                 parser: DouyinParser::new(),
                 auto_recorder: AutoRecorder::new(),
+                recoveries: crate::recovery::Recoveries::default(),
+                #[cfg(test)]
+                test_settings: None,
                 start_lock: AsyncMutex::new(()),
                 lifecycle,
             });
@@ -1544,6 +1746,8 @@ pub fn run() {
             delete_segment,
             get_settings_cmd,
             save_settings_cmd,
+            get_recording_recoveries,
+            cancel_recording_recovery,
             migrate_db_cmd,
             check_for_update,
             desktop::get_lifecycle_status,

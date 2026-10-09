@@ -22,6 +22,7 @@ pub enum RequestSource {
     ManualStart,
     AutoCheck,
     RecordingVerification,
+    RecordingRecovery,
 }
 
 impl RequestSource {
@@ -32,6 +33,7 @@ impl RequestSource {
             Self::ManualStart => "手动开始录制",
             Self::AutoCheck => "自动检测",
             Self::RecordingVerification => "录制结束复核",
+            Self::RecordingRecovery => "断流恢复",
         }
     }
 }
@@ -132,6 +134,10 @@ impl ParseError {
     pub fn is_rate_limited(&self) -> bool {
         self.rate_limited
     }
+
+    pub fn is_authentication_failed(&self) -> bool {
+        self.authentication_failed
+    }
 }
 
 impl Display for ParseError {
@@ -152,6 +158,8 @@ struct ClientSession {
 pub struct DouyinParser {
     session: Mutex<Option<ClientSession>>,
     logger: Option<Arc<RecordingLogger>>,
+    #[cfg(test)]
+    pub test_endpoints: Option<(String, String)>,
 }
 
 impl DouyinParser {
@@ -159,6 +167,8 @@ impl DouyinParser {
         Self {
             session: Mutex::new(None),
             logger: crate::recording_log::logger(),
+            #[cfg(test)]
+            test_endpoints: None,
         }
     }
 
@@ -168,8 +178,38 @@ impl DouyinParser {
         settings: &AppSettings,
         source: RequestSource,
     ) -> Result<LiveInfo, ParseError> {
+        #[cfg(test)]
+        if let Some((session, room)) = &self.test_endpoints {
+            return self
+                .parse_with_endpoints(url, settings, source, session, room)
+                .await;
+        }
         self.parse_with_endpoints(url, settings, source, SESSION_URL, ROOM_API_URL)
             .await
+    }
+
+    pub async fn parse_for_recovery(
+        &self,
+        url: &str,
+        settings: &AppSettings,
+        source: RequestSource,
+        ticket: &mut crate::recovery::Ticket,
+    ) -> Result<LiveInfo, ParseError> {
+        #[cfg(test)]
+        if let Some((session, room)) = &self.test_endpoints {
+            return self
+                .parse_bounded(url, settings, source, session, room, Some(ticket))
+                .await;
+        }
+        self.parse_bounded(
+            url,
+            settings,
+            source,
+            SESSION_URL,
+            ROOM_API_URL,
+            Some(ticket),
+        )
+        .await
     }
 
     // Endpoints are supplied internally so tests exercise real HTTP without contacting Douyin.
@@ -181,17 +221,50 @@ impl DouyinParser {
         session_url: &str,
         room_api_url: &str,
     ) -> Result<LiveInfo, ParseError> {
+        self.parse_bounded(url, settings, source, session_url, room_api_url, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn parse_bounded(
+        &self,
+        url: &str,
+        settings: &AppSettings,
+        source: RequestSource,
+        session_url: &str,
+        room_api_url: &str,
+        mut ticket: Option<&mut crate::recovery::Ticket>,
+    ) -> Result<LiveInfo, ParseError> {
         let room_id = extract_room_id(url)?;
-        let mut session = self.session.lock().await;
+        let queued_trace = ApiTrace::new();
+        let mut session = match bounded(ticket.as_deref_mut(), async {
+            Ok(self.session.lock().await)
+        })
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                if let Some(logger) = &self.logger {
+                    let mut trace = queued_trace;
+                    trace.stage = "session_queue";
+                    logger.write_api(recovery_context(
+                        trace.record(&room_id, source, 1, &Err(error.clone())),
+                        ticket.as_deref(),
+                    ));
+                }
+                return Err(error);
+            }
+        };
 
         for attempt in 0..2 {
-            let mut trace = self
-                .logger
-                .as_ref()
-                .filter(|logger| logger.api_enabled())
-                .map(|_| ApiTrace::new());
+            let mut trace = (ticket.is_some()
+                || self
+                    .logger
+                    .as_ref()
+                    .is_some_and(|logger| logger.api_enabled()))
+            .then(ApiTrace::new);
             let mut room_requested = false;
-            let result = async {
+            let mut result = bounded(ticket.as_deref_mut(), async {
                 let needs_session = session.as_ref().is_none_or(|current| {
                     current.proxy != settings.proxy || current.created_at.elapsed() >= SESSION_TTL
                 });
@@ -207,13 +280,33 @@ impl DouyinParser {
                     &mut trace,
                 )
                 .await
-            }
+            })
             .await;
+            // Even when cancellation interrupts an error-body read, preserve the
+            // already received HTTP classification for monitoring cooldowns.
+            if let (Err(error), Some(status)) =
+                (&mut result, trace.as_ref().and_then(|t| t.http_status))
+            {
+                if let Ok(status) = reqwest::StatusCode::from_u16(status) {
+                    if !status.is_success() {
+                        let http = ParseError::http(status);
+                        error.rate_limited |= http.rate_limited;
+                        error.authentication_failed |= http.authentication_failed;
+                    }
+                }
+            }
             if let (Some(logger), Some(trace)) = (&self.logger, trace) {
-                logger.write_api(trace.record(&room_id, source, attempt + 1, &result));
+                logger.write_api(recovery_context(
+                    trace.record(&room_id, source, attempt + 1, &result),
+                    ticket.as_deref(),
+                ));
             }
             match result {
-                Err(error) if room_requested && should_refresh_session(&error, attempt) => {
+                Err(error)
+                    if room_requested
+                        && ticket.as_ref().is_none_or(|t| t.usable())
+                        && should_refresh_session(&error, attempt) =>
+                {
                     // Build the replacement at the start of the next (also logged) attempt.
                     *session = None;
                 }
@@ -222,6 +315,36 @@ impl DouyinParser {
         }
 
         Err(ParseError::new("抖音登录会话刷新后仍然无效"))
+    }
+}
+
+// Keep cancellation inside the parser so partially received HTTP diagnostics are
+// flushed before the future returns; an outer timeout would silently drop them.
+fn recovery_context(
+    mut record: serde_json::Value,
+    ticket: Option<&crate::recovery::Ticket>,
+) -> serde_json::Value {
+    if let Some(ticket) = ticket {
+        record["recovery_id"] = ticket.id.into();
+        record["task_id"] = ticket.task_id.into();
+        record["room_id"] = ticket.room_id.into();
+    }
+    record
+}
+
+async fn bounded<T>(
+    ticket: Option<&mut crate::recovery::Ticket>,
+    future: impl std::future::Future<Output = Result<T, ParseError>>,
+) -> Result<T, ParseError> {
+    let Some(ticket) = ticket else {
+        return future.await;
+    };
+    tokio::select! {
+        biased;
+        _ = ticket.interrupted() => Err(ParseError::new(if ticket.cancel.borrow().is_some() {
+            "断流恢复已取消，请求未完成"
+        } else { "断流恢复已到截止时间，请求未完成" })),
+        result = future => result,
     }
 }
 
@@ -682,6 +805,7 @@ mod tests {
         let parser = super::DouyinParser {
             session: tokio::sync::Mutex::new(None),
             logger: Some(logger.clone()),
+            test_endpoints: None,
         };
         (dir, parser, logger)
     }
@@ -692,6 +816,191 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn recovery_probes_use_fresh_addresses_and_preserve_all_terminal_decisions() {
+        use super::RequestSource;
+        use crate::recovery::{probe_decision, ProbeDecision, Recoveries};
+        for (status, body, decision) in [
+            (
+                200,
+                r#"{"data":{"data":[{"status":2,"stream_url":{"flv_pull_url":{"ORIGIN":"http://127.0.0.1/new.flv"}}}]}}"#,
+                ProbeDecision::Start,
+            ),
+            (
+                200,
+                r#"{"data":{"data":[{"status":2}]}}"#,
+                ProbeDecision::Retry,
+            ),
+            (
+                200,
+                r#"{"data":{"data":[{"status":4}]}}"#,
+                ProbeDecision::Offline,
+            ),
+            (
+                200,
+                r#"{"data":{"message":"room has finished"}}"#,
+                ProbeDecision::Offline,
+            ),
+            (
+                200,
+                r#"{"data":{"message":"unknown error"}}"#,
+                ProbeDecision::Retry,
+            ),
+            (500, "temporary", ProbeDecision::Retry),
+            (401, "unauthorized", ProbeDecision::Stop),
+            (429, "limited", ProbeDecision::Stop),
+        ] {
+            let (dir, parser, _) = diagnostic_parser(true);
+            let mut responses = vec![
+                mock_response(200, "{}", true),
+                mock_response(500, "first check failed", false),
+                mock_response(status, body, false),
+            ];
+            if status == 401 {
+                responses.extend([
+                    mock_response(200, "{}", true),
+                    mock_response(status, body, false),
+                ]);
+            }
+            let (base, server) = mock_server(responses).await;
+            let registry = Recoveries::default();
+            let mut ticket = registry.begin(1, 10, "manual", 120).unwrap();
+            let settings = Default::default();
+            let first = parser
+                .parse_bounded(
+                    "https://live.douyin.com/123",
+                    &settings,
+                    RequestSource::RecordingVerification,
+                    &base,
+                    &format!("{base}/room"),
+                    Some(&mut ticket),
+                )
+                .await;
+            assert_eq!(probe_decision(&first), ProbeDecision::Retry);
+            let result = parser
+                .parse_bounded(
+                    "https://live.douyin.com/123",
+                    &settings,
+                    RequestSource::RecordingRecovery,
+                    &base,
+                    &format!("{base}/room"),
+                    Some(&mut ticket),
+                )
+                .await;
+            assert_eq!(probe_decision(&result), decision);
+            if decision == ProbeDecision::Start {
+                assert_eq!(result.unwrap().stream_url, "http://127.0.0.1/new.flv");
+            }
+            let records = api_records(&dir);
+            assert_eq!(records.len(), if status == 401 { 3 } else { 2 });
+            assert_eq!(records[0]["source"], "录制结束复核");
+            assert_eq!(records[1]["source"], "断流恢复");
+            if status == 401 {
+                assert_eq!(records[2]["attempt"], 2);
+            }
+            assert_eq!(
+                server.await.unwrap().len(),
+                if status == 401 { 5 } else { 3 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_expired_partial_responses_are_logged_and_never_retried() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for cancel in [false, true] {
+            let (dir, parser, _) = diagnostic_parser(true);
+            let (session, session_server) = mock_server(vec![mock_response(200, "{}", true)]).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let room_api = format!("http://{}/room", listener.local_addr().unwrap());
+            let (sent, received) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\nConnection: close\r\n\r\n{",
+                    )
+                    .await
+                    .unwrap();
+                sent.send(()).unwrap();
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            });
+            let registry = std::sync::Arc::new(crate::recovery::Recoveries::default());
+            let mut ticket = registry.begin(1, 10, "manual", 120).unwrap();
+            ticket.deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let id = ticket.id;
+            let request = tokio::spawn(async move {
+                parser
+                    .parse_bounded(
+                        "https://live.douyin.com/123",
+                        &Default::default(),
+                        super::RequestSource::RecordingRecovery,
+                        &session,
+                        &room_api,
+                        Some(&mut ticket),
+                    )
+                    .await
+            });
+            received.await.unwrap();
+            if cancel {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                registry.cancel(1, Some(id), crate::recovery::CancelReason::User, false);
+            }
+            let error = request.await.unwrap().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(if cancel { "已取消" } else { "截止时间" }));
+            let records = api_records(&dir);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["http_status"], 200);
+            assert_eq!(records[0]["result"], "failed");
+            assert!(records[0]["error"].as_str().unwrap().contains("请求未完成"));
+            session_server.await.unwrap();
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_deadline_bounds_session_queue_and_does_not_poll_late_work() {
+        use std::time::Duration;
+        let (dir, parser, _) = diagnostic_parser(true);
+        let _session = parser.session.lock().await;
+        let registry = crate::recovery::Recoveries::default();
+        let mut ticket = registry.begin(1, 10, "manual", 120).unwrap();
+        let start = tokio::time::Instant::now();
+        let error = parser
+            .parse_bounded(
+                "https://live.douyin.com/123",
+                &Default::default(),
+                super::RequestSource::RecordingRecovery,
+                "unused",
+                "unused",
+                Some(&mut ticket),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("截止时间"));
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            Duration::from_secs(120)
+        );
+        assert_eq!(api_records(&dir)[0]["stage"], "session_queue");
+        let called = std::sync::atomic::AtomicBool::new(false);
+        assert!(super::bounded(Some(&mut ticket), async {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .is_err());
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

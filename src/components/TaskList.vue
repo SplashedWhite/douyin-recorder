@@ -41,6 +41,7 @@
                 {{ getStatusText(task.status, task.conversionState) }}
               </span>
               <span v-if="task.trigger === 'auto'" class="task-trigger-badge">自动</span>
+              <span v-if="task.recovery_from_task_id != null" class="task-trigger-badge" :title="`接续任务 ${task.recovery_from_task_id}`">断流恢复</span>
               <span v-if="task.segmentIndex" class="task-trigger-badge">第 {{ task.segmentIndex }} 段</span>
               <span class="task-time">{{ formatTime(task.start_time) }}</span>
             </div>

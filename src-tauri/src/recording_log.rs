@@ -1008,6 +1008,9 @@ mod tests {
             recorder: crate::Recorder::new("unused".into()),
             parser: crate::DouyinParser::new(),
             auto_recorder: crate::AutoRecorder::new(),
+            recoveries: crate::recovery::Recoveries::default(),
+            #[cfg(test)]
+            test_settings: None,
             start_lock: tokio::sync::Mutex::new(()),
             lifecycle: Default::default(),
         };

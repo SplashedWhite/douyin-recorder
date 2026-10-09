@@ -1,6 +1,6 @@
 [package]
 name = "douyin-recorder"
-version = "0.1.12"
+version = "0.1.13"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -30,3 +30,7 @@ rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
 semver = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tauri = { version = "2", features = ["test"] }

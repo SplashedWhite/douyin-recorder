@@ -122,7 +122,7 @@ async fn real_segments_keep_all_video_frames_audio_and_atomic_mp4_output() {
             1,
             input.to_str().unwrap(),
             &output.path(1),
-            "",
+            &crate::settings::AppSettings::default(),
             Some(&output),
             move |exit| async move {
                 let _ = sender.send(exit);
@@ -196,7 +196,7 @@ async fn concurrent_rooms_keep_separate_sequences_and_durations() {
                 id,
                 input.to_str().unwrap(),
                 &output.path(1),
-                "",
+                &crate::settings::AppSettings::default(),
                 Some(&output),
                 move |exit| async move {
                     let _ = sender.send(exit);
@@ -253,7 +253,7 @@ async fn live_segmentation_keeps_recording_during_conversion_and_flushes_stop() 
             1,
             &url,
             &output.path(1),
-            "",
+            &crate::settings::AppSettings::default(),
             Some(&output),
             move |exit| async move {
                 let _ = sender.send(exit);

@@ -1,9 +1,9 @@
-use crate::{lifecycle::LifecycleStatus, recorder::STOP_WAIT_TIMEOUT, AppState};
+use crate::{lifecycle::LifecycleStatus, recorder::STOP_WAIT_TIMEOUT, AppHandle, AppState};
 use std::sync::atomic::Ordering;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager,
+    Emitter, Manager,
 };
 
 const TRAY_ID: &str = "main-tray";
@@ -151,11 +151,12 @@ pub fn request_close(app: &AppHandle) {
     }
 }
 
-async fn finish_pending_work(app: &AppHandle) -> Result<(), String> {
+pub(crate) async fn finish_pending_work(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let completions = {
         // Synchronize with a recording that was being registered when exit began.
         let _start = state.start_lock.lock().await;
+        crate::recovery_runtime::cancel_all(app, crate::recovery::CancelReason::Shutdown, false);
         state.recorder.request_stop_all_for_exit()?
     };
     let mut failure = None;

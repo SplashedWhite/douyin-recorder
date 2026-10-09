@@ -29,6 +29,7 @@ export interface RecordTask {
   file_path: string | null
   file_size: number | null
   trigger: 'manual' | 'auto'
+  recovery_from_task_id: number | null
   segment_output: { file_prefix: string; output_pattern: string; manifest_path: string; duration_secs: number } | null
   segments: RecordSegment[]
 }
@@ -57,6 +58,13 @@ export interface AppSettings {
   auto_convert_mp4: boolean
   segment_recording_enabled: boolean
   segment_duration_minutes: number
+  ffmpeg_reconnect_enabled: boolean
+  recording_recovery_enabled: boolean
+  recording_recovery_timeout_secs: number
+  ffmpeg_rw_timeout_secs: number
+  ffmpeg_reconnect_max_retries: number
+  ffmpeg_reconnect_delay_max_secs: number
+  ffmpeg_reconnect_delay_total_max_secs: number
   time_format_24h: boolean
   time_display_mode: string
   auto_check_interval_secs: number
@@ -76,6 +84,21 @@ export interface LifecycleStatus {
   message: string | null
 }
 
+export interface RecordingRecovery {
+  recovery_id: number
+  room_id: number
+  from_task_id: number
+  media_received: boolean
+  task_id: number
+  trigger: 'manual' | 'auto'
+  phase: 'confirming' | 'waiting' | 'starting' | 'recording' | 'stable' | 'offline' | 'exhausted' | 'failed' | 'cancelled'
+  attempts: number
+  next_attempt_at: string | null
+  deadline: string
+  last_error: string | null
+  revision: number
+}
+
 export interface RecordingLogInfo {
   directory: string
   last_error: string | null
@@ -91,7 +114,7 @@ export interface UpdateInfo {
 export interface RecordingStatusChanged {
   task: RecordTask
   room: LiveRoom | null
-  reason: 'finalizing' | 'manual_stop' | 'stream_ended' | 'interrupted' | 'failed' | 'auto_started' | 'conversion_started' | 'conversion_finished'
+  reason: 'finalizing' | 'manual_stop' | 'stream_ended' | 'interrupted' | 'failed' | 'auto_started' | 'conversion_started' | 'conversion_finished' | 'recovery_started'
   message: string | null
 }
 
