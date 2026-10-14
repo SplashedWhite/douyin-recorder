@@ -39,6 +39,7 @@ pub struct AppSettings {
     #[serde(deserialize_with = "deserialize_quality")]
     pub quality: String,
     pub recordings_dir: String,
+    pub organize_recordings_by_anchor: bool,
     pub db_path: String,
     pub auto_convert_mp4: bool,
     pub segment_recording_enabled: bool,
@@ -83,6 +84,7 @@ impl Default for AppSettings {
             cookie: String::new(),
             quality: DEFAULT_QUALITY.to_string(),
             recordings_dir: default_recordings,
+            organize_recordings_by_anchor: false,
             db_path: String::new(),
             auto_convert_mp4: false,
             segment_recording_enabled: false,
@@ -226,6 +228,34 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::{load_settings_from, save_settings_at, AppSettings};
+
+    #[test]
+    fn anchor_folders_default_off_and_roundtrip_without_changing_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert!(!AppSettings::default().organize_recordings_by_anchor);
+        assert!(
+            !load_settings_from(&path)
+                .unwrap()
+                .organize_recordings_by_anchor
+        );
+        std::fs::write(
+            &path,
+            r#"{"recordings_dir":"recordings","quality":"HD1","auto_convert_mp4":true}"#,
+        )
+        .unwrap();
+        let mut settings = load_settings_from(&path).unwrap();
+        assert!(!settings.organize_recordings_by_anchor);
+        for enabled in [true, false, true] {
+            settings.organize_recordings_by_anchor = enabled;
+            save_settings_at(&settings, &path).unwrap();
+            let loaded = load_settings_from(&path).unwrap();
+            assert_eq!(loaded.organize_recordings_by_anchor, enabled);
+            assert_eq!(loaded.recordings_dir, "recordings");
+            assert_eq!(loaded.quality, "HD1");
+            assert!(loaded.auto_convert_mp4);
+        }
+    }
 
     #[test]
     fn recovery_defaults_save_reload_and_invalid_save_are_compatible() {

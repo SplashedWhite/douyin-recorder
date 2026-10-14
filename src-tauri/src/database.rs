@@ -9,6 +9,7 @@ pub struct LiveRoom {
     pub platform: String,
     pub room_id: String,
     pub anchor_name: String,
+    pub recording_folder: Option<String>,
     pub room_title: String,
     pub cover_url: String,
     pub avatar_url: String,
@@ -220,6 +221,7 @@ impl Database {
             ("auto_record_retry_at", "TEXT"),
             ("auto_record_error", "TEXT"),
             ("auto_record_revision", "INTEGER NOT NULL DEFAULT 0"),
+            ("recording_folder", "TEXT"),
         ] {
             if !columns.iter().any(|column| column == name) {
                 self.conn.execute(
@@ -268,7 +270,7 @@ impl Database {
 
     pub fn get_all_rooms(&self) -> Result<Vec<LiveRoom>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live, created_at, auto_record_enabled, auto_record_daily_time, auto_record_until, last_schedule_trigger_date, auto_monitor_mode, auto_record_retry_at, auto_record_error, auto_record_revision FROM live_rooms"
+            "SELECT id, platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live, created_at, auto_record_enabled, auto_record_daily_time, auto_record_until, last_schedule_trigger_date, auto_monitor_mode, auto_record_retry_at, auto_record_error, auto_record_revision, recording_folder FROM live_rooms"
         )?;
 
         let rooms = stmt
@@ -291,6 +293,7 @@ impl Database {
                     auto_record_retry_at: row.get(14)?,
                     auto_record_error: row.get(15)?,
                     auto_record_revision: row.get(16)?,
+                    recording_folder: row.get(17)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -300,7 +303,7 @@ impl Database {
 
     pub fn get_room(&self, id: i64) -> Result<LiveRoom> {
         self.conn.query_row(
-            "SELECT id, platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live, created_at, auto_record_enabled, auto_record_daily_time, auto_record_until, last_schedule_trigger_date, auto_monitor_mode, auto_record_retry_at, auto_record_error, auto_record_revision FROM live_rooms WHERE id = ?1",
+            "SELECT id, platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live, created_at, auto_record_enabled, auto_record_daily_time, auto_record_until, last_schedule_trigger_date, auto_monitor_mode, auto_record_retry_at, auto_record_error, auto_record_revision, recording_folder FROM live_rooms WHERE id = ?1",
             [id],
             |row| {
                 Ok(LiveRoom {
@@ -321,6 +324,7 @@ impl Database {
                     auto_record_retry_at: row.get(14)?,
                     auto_record_error: row.get(15)?,
                     auto_record_revision: row.get(16)?,
+                    recording_folder: row.get(17)?,
                 })
             },
         )
@@ -342,6 +346,18 @@ impl Database {
             rusqlite::params![platform, room_id, anchor_name, room_title, cover_url, avatar_url, is_live],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Called under the recording start/database locks; an existing binding is immutable.
+    pub fn bind_recording_folder(&self, id: i64, folder: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE live_rooms SET recording_folder = ?1 WHERE id = ?2 AND (recording_folder IS NULL OR recording_folder = '')",
+            rusqlite::params![folder, id],
+        )?;
+        if changed != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
     }
 
     pub fn update_room_live_status(
@@ -814,6 +830,8 @@ mod tests {
 
         let db = Database::new(&db_path).expect("migrate legacy database");
         let room = db.get_room(1).expect("read migrated room");
+        assert_eq!(room.recording_folder, None);
+        assert_eq!(room.anchor_name, "legacy-anchor");
         assert!(!room.auto_record_enabled);
         assert_eq!(room.auto_record_daily_time, None);
         assert_eq!(room.auto_record_until, None);
@@ -828,6 +846,19 @@ mod tests {
         let task = db.get_task(1).expect("read migrated task");
         assert_eq!(task.trigger, "manual");
 
+        drop(db);
+        let db = Database::new(&db_path).expect("repeat migration");
+        assert_eq!(db.get_room(1).unwrap().recording_folder, None);
+        db.bind_recording_folder(1, "legacy-anchor_legacy-room")
+            .unwrap();
+        assert!(db.bind_recording_folder(1, "replacement").is_err());
+        drop(db);
+        let db = Database::new(&db_path).unwrap();
+        assert_eq!(
+            db.get_all_rooms().unwrap()[0].recording_folder.as_deref(),
+            Some("legacy-anchor_legacy-room")
+        );
+        assert_eq!(db.get_task(1).unwrap().status, "completed");
         drop(db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_dir(temp_dir);

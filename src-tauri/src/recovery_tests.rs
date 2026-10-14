@@ -15,6 +15,15 @@ struct Fixture {
 
 impl Fixture {
     async fn new(segmented: bool, bodies: Vec<(u16, String)>, delay: Duration) -> Self {
+        Self::with_settings(segmented, bodies, delay, |_| {}).await
+    }
+
+    async fn with_settings(
+        segmented: bool,
+        bodies: Vec<(u16, String)>,
+        delay: Duration,
+        configure: impl FnOnce(&mut AppSettings),
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let input = segment_tests::fixture(dir.path(), if segmented { "65" } else { "1" })
             .to_string_lossy()
@@ -58,6 +67,16 @@ impl Fixture {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
+        let mut settings = AppSettings {
+            recordings_dir: dir.path().join("recordings").to_string_lossy().into_owned(),
+            segment_recording_enabled: segmented,
+            segment_duration_minutes: 1,
+            auto_convert_mp4: segmented,
+            ffmpeg_reconnect_enabled: false,
+            recording_recovery_enabled: true,
+            ..Default::default()
+        };
+        configure(&mut settings);
         app.manage(AppState {
             db: Mutex::new(db),
             recorder: Recorder::new(segment_tests::ffmpeg().to_string_lossy().into_owned()),
@@ -66,15 +85,7 @@ impl Fixture {
             recoveries: Default::default(),
             start_lock: AsyncMutex::new(()),
             lifecycle: Default::default(),
-            test_settings: Some(AppSettings {
-                recordings_dir: dir.path().join("recordings").to_string_lossy().into_owned(),
-                segment_recording_enabled: segmented,
-                segment_duration_minutes: 1,
-                auto_convert_mp4: segmented,
-                ffmpeg_reconnect_enabled: false,
-                recording_recovery_enabled: true,
-                ..Default::default()
-            }),
+            test_settings: Some(settings),
         });
         Self {
             app,
@@ -87,6 +98,14 @@ impl Fixture {
     }
 
     async fn start(&self, automatic: bool, bad_input: bool) -> RecordTask {
+        self.try_start(automatic, bad_input).await.unwrap()
+    }
+
+    async fn try_start(
+        &self,
+        automatic: bool,
+        bad_input: bool,
+    ) -> Result<RecordTask, StartRecordError> {
         let state = self.app.state::<AppState>();
         let revision = if automatic {
             let db = state.db.lock().unwrap();
@@ -123,7 +142,6 @@ impl Fixture {
             revision,
         )
         .await
-        .unwrap()
     }
 
     async fn until(&self, ready: impl Fn(&AppState) -> bool) {
@@ -176,6 +194,135 @@ fn live() -> String {
 }
 fn offline() -> String {
     r#"{"data":{"message":"room has finished","prompts":"直播已结束"}}"#.into()
+}
+
+#[tokio::test]
+async fn fixed_folders_keep_manual_auto_and_recovered_outputs_together_after_rename() {
+    for (segmented, automatic) in [(false, false), (false, true), (true, false), (true, true)] {
+        let renamed = live().replace(
+            "\"status\":2",
+            "\"status\":2,\"owner\":{\"nickname\":\"小明（活动）\"}",
+        );
+        let f = Fixture::with_settings(
+            segmented,
+            vec![(200, renamed), (200, offline())],
+            Duration::ZERO,
+            |settings| {
+                settings.organize_recordings_by_anchor = true;
+                settings.auto_convert_mp4 = true;
+            },
+        )
+        .await;
+        {
+            let state = f.app.state::<AppState>();
+            state
+                .db
+                .lock()
+                .unwrap()
+                .update_room_live_status(f.room, "小明 100%（生日）", "", "", "", true)
+                .unwrap();
+        }
+        let first = f.start(automatic, false).await;
+        f.idle().await;
+        let state = f.app.state::<AppState>();
+        let db = state.db.lock().unwrap();
+        let room = db.get_room(f.room).unwrap();
+        assert_eq!(room.anchor_name, "小明（活动）");
+        assert_eq!(
+            room.recording_folder.as_deref(),
+            Some("小明 100%（生日）_123")
+        );
+        let root = f.dir.path().join("recordings");
+        let folder = root.join(room.recording_folder.unwrap());
+        let tasks = db.get_all_tasks().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].recovery_from_task_id, Some(first.id));
+        assert_eq!(tasks[0].status, "completed");
+        assert_eq!(tasks[1].status, "interrupted");
+        for task in &tasks {
+            assert_eq!(task.trigger, if automatic { "auto" } else { "manual" });
+            let expected_name = if task.id == first.id {
+                "小明 100%（生日）"
+            } else {
+                "小明（活动）"
+            };
+            let paths = if segmented {
+                let output = task.segment_output.as_ref().unwrap();
+                assert_eq!(
+                    std::path::Path::new(&output.file_prefix).parent(),
+                    Some(folder.as_path())
+                );
+                let manifest = std::path::Path::new(&output.manifest_path);
+                assert_eq!(manifest.parent().unwrap(), folder.join(".recording-meta"));
+                assert!(manifest.is_file());
+                assert!(task.segments.len() >= 2);
+                task.segments
+                    .iter()
+                    .map(|s| s.file_path.as_str())
+                    .collect::<Vec<_>>()
+            } else {
+                vec![task.file_path.as_deref().unwrap()]
+            };
+            for path in paths {
+                let path = std::path::Path::new(path);
+                assert_eq!(path.parent(), Some(folder.as_path()));
+                assert!(std::fs::metadata(path).unwrap().len() > 0);
+                assert!(path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(expected_name));
+                if task.status == "completed" {
+                    assert_eq!(path.extension().unwrap(), "mp4");
+                }
+            }
+        }
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn fixed_folder_failures_do_not_create_tasks_or_start_ffmpeg() {
+    for database_failure in [false, true] {
+        let f = Fixture::with_settings(false, vec![], Duration::ZERO, |settings| {
+            settings.organize_recordings_by_anchor = true;
+        })
+        .await;
+        let state = f.app.state::<AppState>();
+        let root = f.dir.path().join("recordings");
+        std::fs::create_dir_all(&root).unwrap();
+        if database_failure {
+            state.db.lock().unwrap().conn.execute_batch(
+                "CREATE TRIGGER reject_folder BEFORE UPDATE OF recording_folder ON live_rooms BEGIN SELECT RAISE(ABORT, 'test write failure'); END;"
+            ).unwrap();
+        } else {
+            std::fs::write(root.join("anchor_123"), b"existing file").unwrap();
+        }
+        let error = f.try_start(false, false).await.unwrap_err();
+        assert!(matches!(error, StartRecordError::Fatal(_)));
+        assert!(error.to_string().contains(if database_failure {
+            "保存主播录制文件夹失败"
+        } else {
+            "创建主播录制目录失败"
+        }));
+        assert!(!state.recorder.has_active_records().unwrap());
+        let db = state.db.lock().unwrap();
+        assert!(db.get_all_tasks().unwrap().is_empty());
+        assert!(db.get_room(f.room).unwrap().recording_folder.is_none());
+        if database_failure {
+            assert_eq!(
+                std::fs::read_dir(root.join("anchor_123")).unwrap().count(),
+                0
+            );
+        } else {
+            assert_eq!(
+                std::fs::read(root.join("anchor_123")).unwrap(),
+                b"existing file"
+            );
+        }
+        assert_eq!(f.requests.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]

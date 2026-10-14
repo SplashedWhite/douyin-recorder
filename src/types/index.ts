@@ -5,6 +5,7 @@ export interface LiveRoom {
   platform: string
   room_id: string
   anchor_name: string
+  recording_folder: string | null
   room_title: string
   cover_url: string
   avatar_url: string
@@ -54,6 +55,7 @@ export interface AppSettings {
   cookie: string
   quality: string
   recordings_dir: string
+  organize_recordings_by_anchor: boolean
   db_path: string
   auto_convert_mp4: boolean
   segment_recording_enabled: boolean

@@ -36,6 +36,7 @@ export const useRecorderStore = defineStore('recorder', () => {
     cookie: '',
     quality: DEFAULT_QUALITY,
     recordings_dir: '',
+    organize_recordings_by_anchor: false,
     db_path: '',
     auto_convert_mp4: false,
     segment_recording_enabled: false,

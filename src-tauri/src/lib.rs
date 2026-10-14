@@ -15,6 +15,7 @@ mod migration;
 mod parser;
 mod recorder;
 mod recording_log;
+mod recording_paths;
 mod recovery;
 mod recovery_runtime;
 mod segment_runtime;
@@ -161,19 +162,6 @@ fn set_retry(room: &mut LiveRoom, delay: u64, message: String) {
     room.auto_record_retry_at =
         Some((Utc::now() + ChronoDuration::seconds(delay as i64)).to_rfc3339());
     room.auto_record_error = Some(message);
-}
-
-fn get_recordings_dir(settings: &AppSettings) -> Result<String, String> {
-    let dir = if settings.recordings_dir.is_empty() {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .map_err(|_| "无法获取用户目录".to_string())?;
-        std::path::Path::new(&home).join("DouyinRecordings")
-    } else {
-        std::path::PathBuf::from(&settings.recordings_dir)
-    };
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建录制目录失败: {}", e))?;
-    Ok(dir.to_string_lossy().to_string())
 }
 
 fn file_size(path: Option<&str>) -> i64 {
@@ -669,10 +657,11 @@ async fn start_record_from_info_inner(
         .lock()
         .map_err(|e| StartRecordError::Fatal(e.to_string()))?;
     let fatal = |e: rusqlite::Error| StartRecordError::Fatal(e.to_string());
+    let app_settings = state.settings();
     if let Some((ticket, _)) = recovery {
         if !ticket.usable()
             || !state.recoveries.owns(ticket)
-            || !state.settings().recording_recovery_enabled
+            || !app_settings.recording_recovery_enabled
         {
             return Err(StartRecordError::Superseded);
         }
@@ -701,14 +690,14 @@ async fn start_record_from_info_inner(
             "直播流地址为空，稍后重新检查".to_string(),
         ));
     }
-    let recordings_dir = get_recordings_dir(&state.settings()).map_err(StartRecordError::Fatal)?;
+    let recordings_dir = recording_paths::prepare_directory(&app_settings, &db, &mut room)
+        .map_err(StartRecordError::Fatal)?;
     let task_id = db.add_task(room_id, trigger).map_err(fatal)?;
     if let Some((_, previous)) = recovery {
         db.link_recovery(task_id, previous).map_err(fatal)?;
     }
     let timestamp = Local::now().format("%Y%m%d_%H%M%S");
     // Task id also prevents a quick retry from overwriting an earlier partial file.
-    let app_settings = state.settings();
     let basename = format!(
         "{}_{}_{}_{}",
         segments::safe_filename(&room.anchor_name),
@@ -718,7 +707,7 @@ async fn start_record_from_info_inner(
     );
     let segment_output = app_settings.segment_recording_enabled.then(|| {
         segments::SegmentOutput::new(
-            std::path::Path::new(&recordings_dir),
+            &recordings_dir,
             &basename,
             u64::from(app_settings.segment_duration_minutes.max(1)) * 60,
         )
@@ -727,7 +716,7 @@ async fn start_record_from_info_inner(
         .as_ref()
         .map(|output| output.path(1))
         .unwrap_or_else(|| {
-            std::path::Path::new(&recordings_dir)
+            recordings_dir
                 .join(format!("{basename}.flv"))
                 .to_string_lossy()
                 .into_owned()

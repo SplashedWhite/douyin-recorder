@@ -201,6 +201,11 @@
           clearable
           size="large"
         />
+        <div class="auto-setting-row">
+          <div class="auto-setting-label">按主播分文件夹</div>
+          <el-switch v-model="form.organize_recordings_by_anchor" aria-label="按主播分文件夹" />
+        </div>
+        <div class="quality-note">首次录制时按主播昵称和直播间编号创建固定文件夹，主播改名后继续使用。仅影响新录制，已有文件保留原位置。</div>
       </div>
 
       <div class="settings-section">
@@ -424,6 +429,7 @@ const form = reactive({
   cookie: '',
   quality: DEFAULT_QUALITY,
   recordings_dir: '',
+  organize_recordings_by_anchor: false,
   auto_convert_mp4: false,
   segment_recording_enabled: false,
   segment_duration_minutes: 60,
@@ -463,6 +469,7 @@ function onOpen() {
   form.cookie = store.settings.cookie
   form.quality = normalizeQuality(store.settings.quality)
   form.recordings_dir = store.settings.recordings_dir || ''
+  form.organize_recordings_by_anchor = store.settings.organize_recordings_by_anchor ?? false
   migrationTarget.value = ''
   form.auto_convert_mp4 = store.settings.auto_convert_mp4 ?? false
   form.segment_recording_enabled = store.settings.segment_recording_enabled ?? false

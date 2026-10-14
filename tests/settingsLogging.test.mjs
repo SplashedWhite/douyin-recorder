@@ -71,6 +71,25 @@ async function settingsFixture(overrides = {}, logOverrides = {}) {
   return { state, html, store, saved, opened, errors, commands }
 }
 
+test('fixed anchor folders default off, explain rename behavior, and persist opt-in', async () => {
+  const { state, html, saved } = await settingsFixture({ recordings_dir: 'recordings', auto_convert_mp4: true })
+  assert.equal(state.form.organize_recordings_by_anchor, false)
+  assert.match(html, /aria-label="按主播分文件夹"/)
+  assert.match(html, /主播改名后继续使用/)
+  assert.match(html, /已有文件保留原位置/)
+  for (const enabled of [true, false, true]) {
+    state.form.organize_recordings_by_anchor = enabled
+    await state.onSave()
+    assert.equal(saved.at(-1).organize_recordings_by_anchor, enabled)
+    assert.equal(saved.at(-1).recordings_dir, 'recordings')
+    assert.equal(saved.at(-1).auto_convert_mp4, true)
+    state.onOpen()
+    assert.equal(state.form.organize_recordings_by_anchor, enabled)
+  }
+  const reopened = await settingsFixture(saved.at(-1))
+  assert.equal(reopened.state.form.organize_recordings_by_anchor, true)
+})
+
 test('legacy settings default to disabled API capture and hide its independent limits', async () => {
   const { state, html } = await settingsFixture()
   assert.equal(state.form.api_log_enabled, false)
