@@ -1683,11 +1683,34 @@ pub fn run() {
             desktop::request_restore(app)
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
         .setup(|app| {
             recording_log::initialize();
             let db = Database::new(&settings::get_db_path())?;
             db.reconcile_incomplete_tasks()?;
             let app_settings = settings::load_settings();
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let manager = app.autolaunch();
+                if app_settings.launch_on_startup {
+                    let _ = manager.enable();
+                } else {
+                    let _ = manager.disable();
+                }
+            }
+            // 开机自启拉起时 exe 会携带 --hidden 参数：直接最小化到托盘，不弹出主窗口；
+            // 手动双击或开发启动时无该参数，则显式显示主窗口（窗口配置 visible 已设为 false）。
+            let launched_hidden = std::env::args().any(|a| a == "--hidden");
+            if launched_hidden {
+                if let Err(error) = desktop::enter_tray_at_startup(app.handle()) {
+                    desktop::report_error(app.handle(), format!("开机自启进入托盘失败: {error}"));
+                }
+            } else if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+            }
             reconcile_auto_state_on_startup(&db, &app_settings).map_err(std::io::Error::other)?;
             let lifecycle = Arc::new(lifecycle::Lifecycle::default());
             lifecycle.close_to_tray.store(

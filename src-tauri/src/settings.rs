@@ -58,6 +58,7 @@ pub struct AppSettings {
     pub auto_disable_after_record: bool,
     pub notify_updates: bool,
     pub close_behavior: CloseBehavior,
+    pub launch_on_startup: bool,
     pub log_max_size_mib: u64,
     pub log_backup_count: usize,
     pub api_log_enabled: bool,
@@ -102,7 +103,8 @@ impl Default for AppSettings {
             auto_monitor_window_hours: 6,
             auto_disable_after_record: true,
             notify_updates: true,
-            close_behavior: CloseBehavior::Exit,
+            close_behavior: CloseBehavior::Tray,
+            launch_on_startup: true,
             log_max_size_mib: DEFAULT_LOG_MAX_SIZE_MIB,
             log_backup_count: DEFAULT_LOG_BACKUP_COUNT,
             api_log_enabled: false,
@@ -407,7 +409,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"quality":"HD1","notify_updates":false}"#).unwrap();
         let mut settings = load_settings_from(&path).unwrap();
-        assert_eq!(settings.close_behavior, CloseBehavior::Exit);
+        assert_eq!(settings.close_behavior, CloseBehavior::Tray);
         for behavior in [CloseBehavior::Tray, CloseBehavior::Exit] {
             settings.close_behavior = behavior;
             save_settings_at(&settings, &path).unwrap();
@@ -415,6 +417,22 @@ mod tests {
             assert_eq!(loaded.close_behavior, behavior);
             assert_eq!(loaded.quality, "HD1");
             assert!(!loaded.notify_updates);
+        }
+    }
+
+    #[test]
+    fn launch_on_startup_defaults_to_enabled_and_round_trips_without_losing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"quality":"HD1"}"#).unwrap();
+        let mut settings = load_settings_from(&path).unwrap();
+        assert!(settings.launch_on_startup);
+        for enabled in [false, true] {
+            settings.launch_on_startup = enabled;
+            save_settings_at(&settings, &path).unwrap();
+            let loaded = load_settings_from(&path).unwrap();
+            assert_eq!(loaded.launch_on_startup, enabled);
+            assert_eq!(loaded.quality, "HD1");
         }
     }
 

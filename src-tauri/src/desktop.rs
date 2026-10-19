@@ -135,6 +135,11 @@ fn ensure_tray_visible(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 开机自启拉起时调用：直接最小化到托盘（显示托盘图标并隐藏主窗口），不弹出主窗口。
+pub fn enter_tray_at_startup(app: &AppHandle) -> Result<(), String> {
+    enter_tray(&Desktop(app))
+}
+
 pub fn request_close(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;

@@ -16,6 +16,20 @@
 
       <div class="settings-section">
         <div class="section-header">
+          <span class="section-label">随系统启动</span>
+          <span class="section-hint">开机后自动在后台运行</span>
+        </div>
+        <div class="auto-setting-row">
+          <div>
+            <div class="auto-setting-label">登录系统后自动启动</div>
+            <div class="auto-setting-hint">通过系统登录项（Windows 注册表 / macOS 登录项）实现，关闭后下次开机不再自动运行</div>
+          </div>
+          <el-switch v-model="form.launch_on_startup" aria-label="随系统启动" />
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <div class="section-header">
           <span class="section-label">代理设置</span>
           <span class="section-hint">留空则不使用代理</span>
         </div>
@@ -446,6 +460,7 @@ const form = reactive({
   auto_monitor_window_hours: 6,
   auto_disable_after_record: true,
   notify_updates: true,
+  launch_on_startup: true,
   log_max_size_mib: 5,
   log_backup_count: 4,
   api_log_enabled: false,
@@ -487,6 +502,7 @@ function onOpen() {
   form.auto_monitor_window_hours = store.settings.auto_monitor_window_hours ?? 6
   form.auto_disable_after_record = store.settings.auto_disable_after_record ?? true
   form.notify_updates = store.settings.notify_updates ?? true
+  form.launch_on_startup = store.settings.launch_on_startup ?? true
   form.log_max_size_mib = store.settings.log_max_size_mib ?? 5
   form.log_backup_count = store.settings.log_backup_count ?? 4
   form.api_log_enabled = store.settings.api_log_enabled ?? false
