@@ -104,7 +104,7 @@ impl Default for AppSettings {
             auto_disable_after_record: true,
             notify_updates: true,
             close_behavior: CloseBehavior::Tray,
-            launch_on_startup: true,
+            launch_on_startup: false,
             log_max_size_mib: DEFAULT_LOG_MAX_SIZE_MIB,
             log_backup_count: DEFAULT_LOG_BACKUP_COUNT,
             api_log_enabled: false,
@@ -150,7 +150,7 @@ pub fn load_settings_from(path: &Path) -> Result<AppSettings, String> {
     }
 }
 
-pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), String> {
+pub fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if !(10..=3600).contains(&settings.recording_recovery_timeout_secs) {
         return Err("最长恢复时间必须为 10 到 3600 秒的整数".into());
     }
@@ -184,6 +184,11 @@ pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), Strin
     if !(1..=24).contains(&settings.auto_monitor_window_hours) {
         return Err("自动录制检测窗口必须在 1 到 24 小时之间".to_string());
     }
+    Ok(())
+}
+
+pub fn save_settings_at(settings: &AppSettings, path: &Path) -> Result<(), String> {
+    validate_settings(settings)?;
     let json =
         serde_json::to_string_pretty(settings).map_err(|e| format!("序列化设置失败: {}", e))?;
     let parent = path
@@ -421,12 +426,13 @@ mod tests {
     }
 
     #[test]
-    fn launch_on_startup_defaults_to_enabled_and_round_trips_without_losing_settings() {
+    fn launch_on_startup_defaults_to_disabled_and_round_trips_without_losing_settings() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
+        assert!(!load_settings_from(&path).unwrap().launch_on_startup);
         std::fs::write(&path, r#"{"quality":"HD1"}"#).unwrap();
         let mut settings = load_settings_from(&path).unwrap();
-        assert!(settings.launch_on_startup);
+        assert!(!settings.launch_on_startup);
         for enabled in [false, true] {
             settings.launch_on_startup = enabled;
             save_settings_at(&settings, &path).unwrap();

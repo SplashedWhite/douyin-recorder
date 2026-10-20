@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "douyin-recorder"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "chrono",
  "reqwest 0.12.28",

@@ -22,9 +22,11 @@
         <div class="auto-setting-row">
           <div>
             <div class="auto-setting-label">登录系统后自动启动</div>
-            <div class="auto-setting-hint">通过系统登录项（Windows 注册表 / macOS 登录项）实现，关闭后下次开机不再自动运行</div>
+            <div v-if="autostartAvailable === false" class="auto-setting-hint">开发模式不修改系统自启动，已保留原有设置。请使用正式构建测试此功能。</div>
+            <div v-else-if="autostartAvailable === null" class="auto-setting-hint">{{ autostartCapabilityError || '正在读取自启动可用状态…' }}</div>
+            <div v-else class="auto-setting-hint">默认关闭；开启后，登录系统时自动在后台运行，可随时关闭。</div>
           </div>
-          <el-switch v-model="form.launch_on_startup" aria-label="随系统启动" />
+          <el-switch v-model="form.launch_on_startup" :disabled="autostartAvailable !== true" aria-label="随系统启动" />
         </div>
       </div>
 
@@ -395,6 +397,8 @@ import type { AppSettings, RecordingLogInfo } from '../types'
 
 const visible = defineModel<boolean>({ default: false })
 const store = useRecorderStore()
+const autostartAvailable = ref<boolean | null>(null)
+const autostartCapabilityError = ref('')
 const saving = ref(false)
 const migrating = ref(false)
 const migrationTarget = ref('')
@@ -460,7 +464,7 @@ const form = reactive({
   auto_monitor_window_hours: 6,
   auto_disable_after_record: true,
   notify_updates: true,
-  launch_on_startup: true,
+  launch_on_startup: false,
   log_max_size_mib: 5,
   log_backup_count: 4,
   api_log_enabled: false,
@@ -477,7 +481,7 @@ function formatLogBudget(size: number, count: number): string {
 const logBudgetText = computed(() => formatLogBudget(form.log_max_size_mib, form.log_backup_count))
 const apiLogBudgetText = computed(() => formatLogBudget(form.api_log_max_size_mib, form.api_log_backup_count))
 
-function onOpen() {
+async function onOpen() {
   void refreshLogInfo()
   form.close_behavior = store.settings.close_behavior ?? 'exit'
   form.proxy = store.settings.proxy
@@ -502,12 +506,19 @@ function onOpen() {
   form.auto_monitor_window_hours = store.settings.auto_monitor_window_hours ?? 6
   form.auto_disable_after_record = store.settings.auto_disable_after_record ?? true
   form.notify_updates = store.settings.notify_updates ?? true
-  form.launch_on_startup = store.settings.launch_on_startup ?? true
+  form.launch_on_startup = store.settings.launch_on_startup ?? false
   form.log_max_size_mib = store.settings.log_max_size_mib ?? 5
   form.log_backup_count = store.settings.log_backup_count ?? 4
   form.api_log_enabled = store.settings.api_log_enabled ?? false
   form.api_log_max_size_mib = store.settings.api_log_max_size_mib ?? 5
   form.api_log_backup_count = store.settings.api_log_backup_count ?? 4
+  autostartAvailable.value = null
+  autostartCapabilityError.value = ''
+  try {
+    autostartAvailable.value = await invoke<boolean>('is_autostart_available')
+  } catch {
+    autostartCapabilityError.value = '无法读取自启动可用状态，暂时不能修改此项。请重新打开设置重试。'
+  }
 }
 
 async function onMigrate() {
@@ -571,7 +582,13 @@ async function onSave() {
   }
   saving.value = true
   try {
-    await store.saveSettings({ ...form, db_path: store.settings.db_path })
+    await store.saveSettings({
+      ...form,
+      db_path: store.settings.db_path,
+      launch_on_startup: autostartAvailable.value === true
+        ? form.launch_on_startup
+        : (store.settings.launch_on_startup ?? false),
+    })
     ElMessage.success('设置已保存')
     visible.value = false
   } catch (e) {

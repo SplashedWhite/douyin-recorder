@@ -17,9 +17,22 @@ trait Presentation {
 }
 
 fn enter_tray(presentation: &impl Presentation) -> Result<(), String> {
-    presentation.show_tray()?;
-    if let Err(error) = presentation.hide_window() {
-        let _ = presentation.hide_tray();
+    if let Err(mut error) = presentation
+        .show_tray()
+        .and_then(|()| presentation.hide_window())
+    {
+        // Startup can begin with no visible window. Restore it before removing
+        // any tray icon left behind by a partially successful transition.
+        match presentation.show_window() {
+            Ok(()) => {
+                if let Err(cleanup_error) = presentation.hide_tray() {
+                    error = format!("{error}；清理托盘失败: {cleanup_error}");
+                }
+            }
+            Err(restore_error) => {
+                error = format!("{error}；恢复主窗口也失败: {restore_error}");
+            }
+        }
         return Err(error);
     }
     Ok(())
@@ -237,74 +250,132 @@ pub fn get_lifecycle_status(state: tauri::State<AppState>) -> LifecycleStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     struct FakeDesktop {
         window: Cell<bool>,
         tray: Cell<bool>,
-        fail: &'static str,
+        failures: &'static [&'static str],
+        events: RefCell<Vec<&'static str>>,
+    }
+    impl FakeDesktop {
+        fn new(window: bool, tray: bool, failures: &'static [&'static str]) -> Self {
+            Self {
+                window: Cell::new(window),
+                tray: Cell::new(tray),
+                failures,
+                events: RefCell::new(Vec::new()),
+            }
+        }
     }
     impl Presentation for FakeDesktop {
         fn show_tray(&self) -> Result<(), String> {
-            if self.fail == "show_tray" {
+            self.events.borrow_mut().push("show_tray");
+            if self.failures.contains(&"show_tray") {
                 return Err("托盘不可用".into());
             }
             self.tray.set(true);
+            if self.failures.contains(&"tray_rect") {
+                return Err("托盘位置不可用".into());
+            }
             Ok(())
         }
         fn hide_tray(&self) -> Result<(), String> {
-            if self.fail == "hide_tray" {
+            self.events.borrow_mut().push("hide_tray");
+            if self.failures.contains(&"hide_tray") {
                 return Err("托盘隐藏失败".into());
             }
             self.tray.set(false);
             Ok(())
         }
         fn show_window(&self) -> Result<(), String> {
-            if self.fail == "show_window" {
+            self.events.borrow_mut().push("show_window");
+            if self.failures.contains(&"show_window") {
                 return Err("窗口恢复失败".into());
             }
             self.window.set(true);
             Ok(())
         }
         fn hide_window(&self) -> Result<(), String> {
-            if self.fail == "hide_window" {
+            self.events.borrow_mut().push("hide_window");
+            self.window.set(false);
+            if self.failures.contains(&"hide_window") {
                 return Err("窗口隐藏失败".into());
             }
-            self.window.set(false);
             Ok(())
         }
     }
 
     #[test]
     fn tray_transitions_always_leave_an_accessible_entry_on_failure() {
-        for fail in ["show_tray", "hide_window"] {
-            let desktop = FakeDesktop {
-                window: Cell::new(true),
-                tray: Cell::new(false),
-                fail,
-            };
+        for failures in [&["show_tray"][..], &["tray_rect"][..], &["hide_window"][..]] {
+            let desktop = FakeDesktop::new(true, false, failures);
             assert!(enter_tray(&desktop).is_err());
             assert!(desktop.window.get());
             assert!(!desktop.tray.get());
         }
-        for fail in ["show_window", "hide_tray"] {
-            let desktop = FakeDesktop {
-                window: Cell::new(false),
-                tray: Cell::new(true),
-                fail,
-            };
+        for failures in [&["show_window"][..], &["hide_tray"][..]] {
+            let desktop = FakeDesktop::new(false, true, failures);
             assert!(leave_tray(&desktop).is_err());
             assert!(desktop.tray.get());
         }
     }
 
     #[test]
+    fn hidden_startup_restores_window_before_cleaning_up_a_failed_tray() {
+        for failures in [&["show_tray"][..], &["tray_rect"][..], &["hide_window"][..]] {
+            let desktop = FakeDesktop::new(false, false, failures);
+            assert!(enter_tray(&desktop).is_err());
+            assert!(desktop.window.get());
+            assert!(!desktop.tray.get());
+            assert!(desktop
+                .events
+                .borrow()
+                .ends_with(&["show_window", "hide_tray"]));
+        }
+    }
+
+    #[test]
+    fn failed_window_recovery_preserves_tray_and_reports_both_errors() {
+        for failures in [
+            &["tray_rect", "show_window"][..],
+            &["hide_window", "show_window"][..],
+        ] {
+            let desktop = FakeDesktop::new(false, false, failures);
+            let error = enter_tray(&desktop).unwrap_err();
+            assert!(error.contains(if failures[0] == "tray_rect" {
+                "托盘位置不可用"
+            } else {
+                "窗口隐藏失败"
+            }));
+            assert!(error.contains("恢复主窗口也失败"));
+            assert!(desktop.tray.get());
+            assert!(!desktop.events.borrow().contains(&"hide_tray"));
+        }
+    }
+
+    #[test]
+    fn failed_tray_cleanup_keeps_recovered_window_visible_and_reports_failure() {
+        let desktop = FakeDesktop::new(false, false, &["tray_rect", "hide_tray"]);
+        let error = enter_tray(&desktop).unwrap_err();
+        assert!(desktop.window.get());
+        assert!(desktop.tray.get());
+        assert!(error.contains("托盘位置不可用"));
+        assert!(error.contains("清理托盘失败"));
+    }
+
+    #[test]
+    fn successful_hidden_startup_never_shows_window() {
+        let desktop = FakeDesktop::new(false, false, &[]);
+        enter_tray(&desktop).unwrap();
+        assert!(!desktop.window.get());
+        assert!(desktop.tray.get());
+        assert_eq!(*desktop.events.borrow(), ["show_tray", "hide_window"]);
+    }
+
+    #[test]
     fn repeated_close_and_restore_never_leave_both_entries_hidden() {
-        let desktop = FakeDesktop {
-            window: Cell::new(true),
-            tray: Cell::new(false),
-            fail: "",
-        };
+        let desktop = FakeDesktop::new(true, false, &[]);
         for _ in 0..5 {
             enter_tray(&desktop).unwrap();
             enter_tray(&desktop).unwrap();
