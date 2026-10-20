@@ -103,7 +103,7 @@ impl Default for AppSettings {
             auto_monitor_window_hours: 6,
             auto_disable_after_record: true,
             notify_updates: true,
-            close_behavior: CloseBehavior::Tray,
+            close_behavior: CloseBehavior::Exit,
             launch_on_startup: false,
             log_max_size_mib: DEFAULT_LOG_MAX_SIZE_MIB,
             log_backup_count: DEFAULT_LOG_BACKUP_COUNT,
@@ -414,7 +414,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"quality":"HD1","notify_updates":false}"#).unwrap();
         let mut settings = load_settings_from(&path).unwrap();
-        assert_eq!(settings.close_behavior, CloseBehavior::Tray);
+        assert_eq!(settings.close_behavior, CloseBehavior::Exit);
         for behavior in [CloseBehavior::Tray, CloseBehavior::Exit] {
             settings.close_behavior = behavior;
             save_settings_at(&settings, &path).unwrap();
