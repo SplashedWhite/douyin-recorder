@@ -73,6 +73,7 @@ export interface AppSettings {
   auto_monitor_window_hours: number
   auto_disable_after_record: boolean
   notify_updates: boolean
+  launch_on_startup: boolean
   log_max_size_mib: number
   log_backup_count: number
   api_log_enabled: boolean

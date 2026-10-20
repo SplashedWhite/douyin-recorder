@@ -7,6 +7,7 @@ unsafe extern "C" {}
 
 mod auto_policy;
 mod auto_recorder;
+mod autostart;
 mod conversion;
 mod database;
 mod desktop;
@@ -1154,9 +1155,15 @@ async fn save_settings_cmd(
     state: State<'_, AppState>,
     new_settings: AppSettings,
 ) -> Result<AppSettings, String> {
+    use tauri_plugin_autostart::ManagerExt;
     let _operation = state.lifecycle.operation()?;
     let _start = state.start_lock.lock().await;
-    let saved = migration::save_settings(&state, new_settings, &settings::settings_path())?;
+    let saved = migration::save_settings(
+        &state,
+        new_settings,
+        &settings::settings_path(),
+        &*app.autolaunch(),
+    )?;
     if !saved.recording_recovery_enabled {
         recovery_runtime::cancel_all(&app, recovery::CancelReason::Settings, true);
     }
@@ -1683,6 +1690,10 @@ pub fn run() {
             desktop::request_restore(app)
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
         .setup(|app| {
             recording_log::initialize();
             let db = Database::new(&settings::get_db_path())?;
@@ -1705,6 +1716,26 @@ pub fn run() {
                 start_lock: AsyncMutex::new(()),
                 lifecycle,
             });
+            // Register state before reporting startup errors so the frontend can
+            // retrieve them even if its event listener has not connected yet.
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                if let Err(error) =
+                    autostart::sync_on_startup(&*app.autolaunch(), app_settings.launch_on_startup)
+                {
+                    desktop::report_error(app.handle(), format!("同步系统自启动设置失败: {error}"));
+                }
+            }
+            // Hidden startup must recover the window if the tray is unavailable.
+            let launched_hidden = std::env::args().any(|a| a == "--hidden");
+            let presentation = if launched_hidden {
+                desktop::enter_tray_at_startup(app.handle())
+            } else {
+                desktop::restore_window(app.handle())
+            };
+            if let Err(error) = presentation {
+                desktop::report_error(app.handle(), format!("初始化窗口或托盘失败: {error}"));
+            }
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(auto_record_loop(app_handle));
             Ok(())
@@ -1735,6 +1766,7 @@ pub fn run() {
             delete_segment,
             get_settings_cmd,
             save_settings_cmd,
+            autostart::is_autostart_available,
             get_recording_recoveries,
             cancel_recording_recovery,
             migrate_db_cmd,

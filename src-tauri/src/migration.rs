@@ -1,4 +1,4 @@
-use crate::{settings, AppSettings, AppState};
+use crate::{autostart, settings, AppSettings, AppState};
 use std::path::Path;
 
 /// Run on a blocking thread; lock ordering matches recording startup.
@@ -34,11 +34,20 @@ pub fn save_settings(
     state: &AppState,
     mut new_settings: AppSettings,
     settings_path: &Path,
+    autostart: &impl autostart::Autostart,
 ) -> Result<AppSettings, String> {
     // Ordinary saves cannot redirect the next startup to a stale or unmigrated database.
     let db = state.db.lock().map_err(|e| e.to_string())?;
     new_settings.db_path = db.path().to_string_lossy().to_string();
-    settings::save_settings_at(&new_settings, settings_path)?;
+    if !autostart.can_manage() {
+        // Debug and release share this file. Ignore a stale or manipulated UI value.
+        new_settings.launch_on_startup =
+            settings::load_settings_from(settings_path)?.launch_on_startup;
+    }
+    settings::validate_settings(&new_settings)?;
+    autostart::save_with_autostart(autostart, new_settings.launch_on_startup, || {
+        settings::save_settings_at(&new_settings, settings_path)
+    })?;
     // Apply under the same lock as persistence so concurrent saves cannot restore older limits.
     crate::recording_log::configure(&new_settings);
     Ok(new_settings)
@@ -47,6 +56,7 @@ pub fn save_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autostart::test_support::FakeAutostart;
     use crate::{AutoRecorder, Database, DouyinParser, Recorder};
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
@@ -247,11 +257,115 @@ mod tests {
         let target = fixture.dir.path().join("target.db");
         let migrated = fixture.migrate(&target).unwrap();
         stale.quality = "SD2".to_string();
-        let saved = save_settings(&fixture.state, stale, &fixture.config).unwrap();
+        let manager = FakeAutostart::new(false);
+        let saved = save_settings(&fixture.state, stale, &fixture.config, &manager).unwrap();
         assert_eq!(saved.db_path, migrated);
+        assert_eq!(manager.enabled.get(), saved.launch_on_startup);
         let reloaded = settings::load_settings_from(&fixture.config).unwrap();
         assert_eq!(reloaded.db_path, migrated);
         assert_eq!(reloaded.quality, "SD2");
+    }
+
+    #[test]
+    fn invalid_settings_never_touch_autostart_or_the_config() {
+        let fixture = Fixture::new();
+        let before = std::fs::read(&fixture.config).unwrap();
+        let manager = FakeAutostart::new(false);
+        let mut invalid = settings::load_settings_from(&fixture.config).unwrap();
+        invalid.launch_on_startup = true;
+        invalid.auto_check_interval_secs = 0;
+        assert!(
+            save_settings(&fixture.state, invalid, &fixture.config, &manager)
+                .unwrap_err()
+                .contains("自动录制检测间隔")
+        );
+        assert_eq!(manager.reads.get(), 0);
+        assert!(manager.writes.borrow().is_empty());
+        assert_eq!(std::fs::read(&fixture.config).unwrap(), before);
+    }
+
+    #[test]
+    fn protected_saves_preserve_persisted_autostart_while_saving_other_settings() {
+        for enabled in [true, false] {
+            let fixture = Fixture::new();
+            let mut current = settings::load_settings_from(&fixture.config).unwrap();
+            current.launch_on_startup = enabled;
+            settings::save_settings_at(&current, &fixture.config).unwrap();
+            let manager = FakeAutostart::new(enabled);
+            manager.available.set(false);
+            manager.fail_read.set(true);
+            let requested = AppSettings {
+                launch_on_startup: !enabled,
+                quality: "HD1".into(),
+                db_path: "stale.db".into(),
+                ..current
+            };
+            let saved =
+                save_settings(&fixture.state, requested, &fixture.config, &manager).unwrap();
+            let reloaded = settings::load_settings_from(&fixture.config).unwrap();
+            assert_eq!(saved.launch_on_startup, enabled);
+            assert_eq!(reloaded.launch_on_startup, enabled);
+            assert_eq!(reloaded.quality, "HD1");
+            assert_eq!(reloaded.db_path, saved.db_path);
+            assert_ne!(saved.db_path, "stale.db");
+            assert_eq!(manager.reads.get(), 0);
+            assert!(manager.writes.borrow().is_empty());
+            assert_eq!(manager.enabled.get(), enabled);
+        }
+    }
+
+    #[test]
+    fn protected_save_does_not_overwrite_unreadable_autostart_preferences() {
+        let fixture = Fixture::new();
+        std::fs::write(&fixture.config, b"invalid settings").unwrap();
+        let manager = FakeAutostart::new(true);
+        manager.available.set(false);
+        assert!(save_settings(
+            &fixture.state,
+            AppSettings::default(),
+            &fixture.config,
+            &manager
+        )
+        .unwrap_err()
+        .contains("读取设置失败"));
+        assert_eq!(std::fs::read(&fixture.config).unwrap(), b"invalid settings");
+        assert_eq!(manager.reads.get(), 0);
+        assert!(manager.writes.borrow().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_replace_failure_rolls_back_autostart_and_allows_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let before = std::fs::read(&fixture.config).unwrap();
+        let manager = FakeAutostart::new(false);
+        let mut new_settings = settings::load_settings_from(&fixture.config).unwrap();
+        new_settings.launch_on_startup = true;
+        new_settings.quality = "HD1".into();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&fixture.config)
+            .unwrap();
+        let error = save_settings(
+            &fixture.state,
+            new_settings.clone(),
+            &fixture.config,
+            &manager,
+        )
+        .unwrap_err();
+        assert!(error.contains("替换设置文件失败"));
+        assert!(!manager.enabled.get());
+        assert_eq!(std::fs::read(&fixture.config).unwrap(), before);
+        drop(lock);
+        let saved = save_settings(&fixture.state, new_settings, &fixture.config, &manager).unwrap();
+        assert!(manager.enabled.get());
+        assert_eq!(saved.quality, "HD1");
+        assert_eq!(
+            serde_json::to_value(settings::load_settings_from(&fixture.config).unwrap()).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
     }
 
     #[test]
