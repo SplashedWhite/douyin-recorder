@@ -62,16 +62,24 @@
       <TransitionGroup name="room">
         <div v-for="room in rooms" :key="room.id" class="room-card">
           <!-- Avatar -->
-          <div class="room-avatar" :class="{ live: room.is_live }">
-            <img
-              v-if="room.avatar_url"
-              :src="room.avatar_url"
-              :alt="room.anchor_name"
-              class="avatar-img"
-              @error="($event.target as HTMLImageElement).style.display = 'none'"
-            />
-            <span v-else class="avatar-fallback">{{ getInitial(room.anchor_name) }}</span>
-            <span v-if="room.is_live" class="live-dot"></span>
+          <div
+            class="room-avatar-wrap"
+            @mouseenter="onAvatarHover(room, $event)"
+            @mouseleave="onAvatarLeave"
+            @click="openLiveRoom(room)"
+            :title="room.is_live ? '悬停预览 · 点击进入直播间' : '未开播'"
+          >
+            <div class="room-avatar" :class="{ live: room.is_live }">
+              <img
+                v-if="room.avatar_url"
+                :src="room.avatar_url"
+                :alt="room.anchor_name"
+                class="avatar-img"
+                @error="($event.target as HTMLImageElement).style.display = 'none'"
+              />
+              <span v-else class="avatar-fallback">{{ getInitial(room.anchor_name) }}</span>
+              <span v-if="room.is_live" class="live-dot"></span>
+            </div>
           </div>
 
           <!-- Info -->
@@ -201,16 +209,37 @@
         </div>
       </template>
     </el-dialog>
+
+    <!-- 悬停预览浮窗：零端口直连，flv.js 直接播放抖音直播流 -->
+    <transition name="preview-fade">
+      <div
+        v-if="previewVisible"
+        class="preview-pop"
+        :style="{ left: previewPos.left + 'px', top: previewPos.top + 'px', width: previewSize.w + 'px', height: previewSize.h + 'px' }"
+        @mouseenter="onPopupEnter"
+        @mouseleave="onPopupLeave"
+        @click="openLiveRoom(previewRoom)"
+      >
+        <video ref="videoRef" class="preview-video" muted autoplay playsinline></video>
+        <div v-if="previewState === 'loading'" class="preview-tip">预览加载中…</div>
+        <div v-else-if="previewState === 'error'" class="preview-tip preview-tip--error">
+          {{ previewError || '预览不可用' }}
+        </div>
+        <div class="preview-foot">悬停预览 · 点击进入直播间</div>
+      </div>
+    </transition>
   </el-card>
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { recoveryPending, recoveryText } from '../utils/recovery'
 import { Plus, Delete, VideoPlay, VideoPause, Refresh, Timer, Setting } from '@element-plus/icons-vue'
 import { useRecorderStore } from '../stores/recorder'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { invoke } from '@tauri-apps/api/core'
+import flvjs from 'flv.js'
 import type { AutoMonitorMode, LiveRoom } from '../types'
 
 const store = useRecorderStore()
@@ -226,6 +255,20 @@ const monitorMode = ref<AutoMonitorMode>('window')
 const configSaving = ref(false)
 const displayNow = ref(Date.now())
 let displayTimer: number | undefined
+
+// ── 悬停预览（零端口直连）状态 ──
+const previewVisible = ref(false)
+const previewRoomId = ref<number | null>(null)
+const previewRoom = ref<LiveRoom | null>(null)
+const previewState = ref<'idle' | 'loading' | 'playing' | 'error'>('idle')
+const previewError = ref('')
+const previewPos = ref<{ left: number; top: number }>({ left: 0, top: 0 })
+const videoRef = ref<HTMLVideoElement | null>(null)
+const MAX_PREVIEW_W = 240
+const previewSize = ref({ w: MAX_PREVIEW_W, h: Math.round(MAX_PREVIEW_W * 16 / 9) })
+let lastAnchor: HTMLElement | null = null
+let flvPlayer: flvjs.Player | null = null
+let hideTimer: number | undefined
 
 onMounted(() => {
   displayTimer = window.setInterval(() => {
@@ -406,6 +449,164 @@ async function deleteRoom(room: LiveRoom) {
     }
   }
 }
+
+// ── 悬停预览：零端口直连（flv.js 直接播放抖音流） ──
+function positionPreview(anchor: HTMLElement) {
+  const r = anchor.getBoundingClientRect()
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const w = previewSize.value.w
+  const h = previewSize.value.h
+  let left = r.right + 10
+  if (left + w > vw - 8) left = r.left - w - 10
+  if (left < 8) left = 8
+  let top = r.top
+  if (top + h > vh - 8) top = vh - h - 8
+  if (top < 8) top = 8
+  previewPos.value = { left, top }
+}
+
+function destroyPlayer() {
+  if (flvPlayer) {
+    try { flvPlayer.destroy() } catch { /* 忽略销毁异常 */ }
+    flvPlayer = null
+  }
+}
+
+function clearHideTimer() {
+  if (hideTimer !== undefined) {
+    window.clearTimeout(hideTimer)
+    hideTimer = undefined
+  }
+}
+
+function closePreview() {
+  clearHideTimer()
+  destroyPlayer()
+  previewVisible.value = false
+  previewRoomId.value = null
+  previewRoom.value = null
+  previewState.value = 'idle'
+  previewError.value = ''
+}
+
+function scheduleHide() {
+  clearHideTimer()
+  hideTimer = window.setTimeout(() => closePreview(), 140)
+}
+
+// 视频元数据就绪后按真实比例调整预览浮窗，与播放窗口保持一致
+function onPreviewMeta() {
+  const v = videoRef.value
+  if (!v || !v.videoWidth || !v.videoHeight) return
+  const aspect = v.videoWidth / v.videoHeight
+  const maxH = Math.min(window.innerHeight - 40, 680)
+  const maxW = 360
+  let w: number, h: number
+  if (aspect >= 1) {
+    h = Math.min(maxH, 240)
+    w = Math.round(h * aspect)
+    if (w > maxW) { w = maxW; h = Math.round(w / aspect) }
+  } else {
+    w = MAX_PREVIEW_W
+    h = Math.round(w / aspect)
+    if (h > maxH) { h = maxH; w = Math.round(h * aspect) }
+    if (w < 160) { w = 160; h = Math.round(w / aspect) }
+  }
+  previewSize.value = { w, h }
+  if (lastAnchor && previewVisible.value) positionPreview(lastAnchor)
+}
+
+async function startPlayback(url: string) {
+  await nextTick()
+  const video = videoRef.value
+  if (!video) return
+  if (!flvjs.isSupported()) {
+    previewState.value = 'error'
+    previewError.value = '当前环境不支持 flv 播放'
+    return
+  }
+  destroyPlayer()
+  const mediaDataSource = {
+    type: 'flv',
+    url,
+    isLive: true,
+    cors: true,
+    hasAudio: true,
+    xhrSetup(xhr: XMLHttpRequest) {
+      xhr.setRequestHeader('Referer', 'https://live.douyin.com/')
+      xhr.setRequestHeader('User-Agent', navigator.userAgent)
+    },
+  } as flvjs.MediaDataSource
+  const player = flvjs.createPlayer(mediaDataSource, {
+    enableStashBuffer: true,
+    stashInitialSize: 128,
+  })
+  video.addEventListener('loadedmetadata', onPreviewMeta)
+  player.attachMediaElement(video)
+  player.on(flvjs.Events.ERROR, () => {
+    if (previewVisible.value) {
+      previewState.value = 'error'
+      previewError.value = '直播流加载失败（可能被防盗链拦截）'
+    }
+  })
+  player.load()
+  try {
+    await video.play()
+  } catch { /* 静音自动播放通常可用 */ }
+  flvPlayer = player
+  previewState.value = 'playing'
+}
+
+async function onAvatarHover(room: LiveRoom, e: MouseEvent) {
+  if (!room.is_live) return
+  clearHideTimer()
+  if (previewVisible.value && previewRoomId.value === room.id) return
+  const anchor = e.currentTarget as HTMLElement
+  lastAnchor = anchor
+  previewSize.value = { w: MAX_PREVIEW_W, h: Math.round(MAX_PREVIEW_W * 16 / 9) }
+  positionPreview(anchor)
+  previewRoomId.value = room.id
+  previewRoom.value = room
+  previewVisible.value = true
+  previewState.value = 'loading'
+  previewError.value = ''
+  try {
+    const url = await invoke<string>('get_live_preview_url', { roomId: room.id })
+    if (previewRoomId.value !== room.id || !previewVisible.value) return
+    await startPlayback(url)
+  } catch (err: any) {
+    if (previewRoomId.value !== room.id || !previewVisible.value) return
+    previewState.value = 'error'
+    previewError.value = String(err) || '预览不可用'
+  }
+}
+
+function onAvatarLeave() {
+  scheduleHide()
+}
+
+function onPopupEnter() {
+  clearHideTimer()
+}
+
+function onPopupLeave() {
+  scheduleHide()
+}
+
+async function openLiveRoom(room: LiveRoom | null) {
+  if (!room) return
+  if (!room.is_live) {
+    ElMessage.info('该主播未开播')
+    return
+  }
+  try {
+    await invoke('open_live_window', { roomId: room.id })
+  } catch (e: any) {
+    ElMessage.error(`打开播放窗口失败: ${e}`)
+  }
+}
+
 </script>
 
 <style scoped>
@@ -822,5 +1023,100 @@ async function deleteRoom(room: LiveRoom) {
 .room-leave-to {
   opacity: 0;
   transform: translateX(-10px);
+}
+
+/* ── Hover preview wrapper ── */
+.room-avatar-wrap {
+  position: relative;
+  flex-shrink: 0;
+  display: inline-flex;
+  cursor: pointer;
+}
+
+.room-avatar-wrap .room-avatar {
+  cursor: pointer;
+}
+
+/* ── Hover preview popup ── */
+.preview-pop {
+  position: fixed;
+  z-index: 9999;
+  border-radius: 10px;
+  background: #000;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+}
+
+/* 透明桥接区：避免从头像移动到浮窗时鼠标穿越空隙导致提前关闭（左右两侧各一段） */
+.preview-pop::before,
+.preview-pop::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 14px;
+}
+
+.preview-pop::before {
+  left: -14px;
+}
+
+.preview-pop::after {
+  right: -14px;
+}
+
+.preview-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #000;
+  border-radius: 10px;
+}
+
+.preview-tip {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0 16px;
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.6;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 10px;
+  pointer-events: none;
+}
+
+.preview-tip--error {
+  color: #ffb4b4;
+}
+
+.preview-foot {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 4px 8px;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.85);
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0));
+  border-bottom-left-radius: 10px;
+  border-bottom-right-radius: 10px;
+  pointer-events: none;
+}
+
+/* ── Preview fade ── */
+.preview-fade-enter-active,
+.preview-fade-leave-active {
+  transition: opacity 0.15s ease;
+}
+
+.preview-fade-enter-from,
+.preview-fade-leave-to {
+  opacity: 0;
 }
 </style>

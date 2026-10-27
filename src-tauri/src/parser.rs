@@ -23,6 +23,7 @@ pub enum RequestSource {
     AutoCheck,
     RecordingVerification,
     RecordingRecovery,
+    Preview,
 }
 
 impl RequestSource {
@@ -34,6 +35,7 @@ impl RequestSource {
             Self::AutoCheck => "自动检测",
             Self::RecordingVerification => "录制结束复核",
             Self::RecordingRecovery => "断流恢复",
+            Self::Preview => "悬停预览",
         }
     }
 }

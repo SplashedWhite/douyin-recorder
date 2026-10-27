@@ -39,11 +39,14 @@ use recorder::{Recorder, RecordingExit};
 use serde::Serialize;
 use serde_json::json;
 use settings::AppSettings;
+use std::collections::HashMap;
 use std::sync::{atomic::Ordering, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(not(test))]
 use tauri::AppHandle;
 use tauri::{Emitter, Manager, State};
+use tauri::WebviewUrl;
+use tauri::WebviewWindowBuilder;
 #[cfg(test)]
 type AppHandle = tauri::AppHandle<tauri::test::MockRuntime>;
 #[cfg(all(test, windows))]
@@ -93,6 +96,13 @@ struct AppState {
     lifecycle: Arc<lifecycle::Lifecycle>,
     #[cfg(test)]
     test_settings: Option<AppSettings>,
+    preview_cache: Mutex<HashMap<i64, PreviewCacheEntry>>,
+}
+
+/// 悬停预览取流结果的短期缓存，避免鼠标进出反复触发抖音解析导致限流。
+struct PreviewCacheEntry {
+    url: String,
+    expires_at: Instant,
 }
 
 impl AppState {
@@ -1231,6 +1241,117 @@ async fn refresh_room(state: State<'_, AppState>, room_id: i64) -> Result<LiveRo
     refresh_room_internal(&state, room_id).await
 }
 
+/// 悬停预览：零端口直连方案。后端只负责解析抖音直播流地址并回传，
+/// 前端拿到地址后用 flv.js 直接在 <video> 中播放，不经过任何本地代理端口。
+#[tauri::command]
+async fn get_live_preview_url(
+    state: State<'_, AppState>,
+    room_id: i64,
+) -> Result<String, String> {
+    let _operation = state.lifecycle.operation()?;
+
+    // 命中短期缓存则直接返回，避免鼠标进出反复触发解析被抖音限流。
+    {
+        let cache = state.preview_cache.lock().map_err(|e| e.to_string())?;
+        if let Some(entry) = cache.get(&room_id) {
+            if entry.expires_at > Instant::now() {
+                return Ok(entry.url.clone());
+            }
+        }
+    }
+
+    let douyin_url = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        let room = db.get_room(room_id).map_err(|e| e.to_string())?;
+        format!("https://live.douyin.com/{}", room.room_id)
+    };
+    let app_settings = state.settings();
+    let info = state
+        .parser
+        .parse_douyin_url(&douyin_url, &app_settings, RequestSource::Preview)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !info.is_live {
+        return Err("该主播当前未开播".to_string());
+    }
+    if info.stream_url.is_empty() {
+        return Err("未获取到直播流地址".to_string());
+    }
+    {
+        let mut cache = state.preview_cache.lock().map_err(|e| e.to_string())?;
+        cache.insert(
+            room_id,
+            PreviewCacheEntry {
+                url: info.stream_url.clone(),
+                expires_at: Instant::now() + Duration::from_secs(30),
+            },
+        );
+    }
+    Ok(info.stream_url)
+}
+
+/// 点击主播头像时打开一个独立的本地直播播放窗口（零端口直连）。
+/// 后端只负责新建/聚焦一个标签为 `live-{room_id}` 的 WebviewWindow，
+/// 窗口内前端据 label 渲染 LiveWindow 组件，用 flv.js 直接播放（无弹幕）。
+/// 若同名窗口已存在则聚焦到已有窗口，避免重复打开。
+#[tauri::command]
+async fn open_live_window(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    room_id: i64,
+) -> Result<(), String> {
+    let label = format!("live-{}", room_id);
+
+    // 已存在则聚焦，不重复创建
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.unminimize();
+        let _ = existing.show();
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+
+    // 取主播名作为窗口标题（失败时退化为房间号）
+    let title = {
+        let db = state.db.lock().map_err(|e| e.to_string())?;
+        match db.get_room(room_id) {
+            Ok(room) => room.anchor_name.clone(),
+            Err(_) => format!("直播间 {}", room_id),
+        }
+    };
+
+    // 无系统标题栏 + 竖屏 9:16 比例，贴合抖音直播画面，避免 letterbox 黑边。
+    // 顶栏与控制由前端 LiveWindow.vue 自定义极窄条实现。
+    let window = WebviewWindowBuilder::new(&app, label, WebviewUrl::App("/".into()))
+        .title(title)
+        .resizable(true)
+        .decorations(false)
+        .min_inner_size(220.0, 180.0)
+        .inner_size(360.0, 600.0)
+        .shadow(true)
+        .center()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // 防止新窗口被主窗口遮挡或初始隐藏
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    Ok(())
+}
+
+/// 取直播间主播名（用于独立播放窗口的标题显示「xxx的直播间」）。
+/// 仅查本地数据库，不触发抖音解析，开销极低。
+#[tauri::command]
+async fn get_anchor_name(
+    state: State<'_, AppState>,
+    room_id: i64,
+) -> Result<String, String> {
+    let _operation = state.lifecycle.operation()?;
+    let db = state.db.lock().map_err(|e| e.to_string())?;
+    let room = db.get_room(room_id).map_err(|e| e.to_string())?;
+    Ok(room.anchor_name)
+}
+
 #[tauri::command]
 async fn set_room_auto_record(
     app: AppHandle,
@@ -1715,6 +1836,7 @@ pub fn run() {
                 test_settings: None,
                 start_lock: AsyncMutex::new(()),
                 lifecycle,
+                preview_cache: Mutex::new(HashMap::new()),
             });
             // Register state before reporting startup errors so the frontend can
             // retrieve them even if its event listener has not connected yet.
@@ -1752,6 +1874,9 @@ pub fn run() {
             get_rooms,
             add_room,
             refresh_room,
+            get_live_preview_url,
+            open_live_window,
+            get_anchor_name,
             set_room_auto_record,
             set_room_auto_schedule,
             set_room_auto_config,

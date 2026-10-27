@@ -1,5 +1,6 @@
 <template>
-  <div id="app">
+  <LiveWindow v-if="isLiveWindow" />
+  <div v-else id="app">
     <div class="app-container">
       <header class="app-header">
         <div class="header-content">
@@ -61,6 +62,7 @@ import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { Setting, TopRight } from '@element-plus/icons-vue'
 import { openUrl } from '@tauri-apps/plugin-opener'
 import { invoke } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type { LifecycleStatus } from './types'
 import { ElMessage } from 'element-plus'
@@ -68,8 +70,11 @@ import { useRecorderStore } from './stores/recorder'
 import RoomList from './components/RoomList.vue'
 import TaskList from './components/TaskList.vue'
 import Settings from './components/Settings.vue'
+import LiveWindow from './components/LiveWindow.vue'
 
 const store = useRecorderStore()
+const currentWindow = getCurrentWindow()
+const isLiveWindow = currentWindow.label.startsWith('live-')
 const showSettings = ref(false)
 const lifecycleStatus = ref<LifecycleStatus>({ exiting: false, revision: -1, message: null })
 let unlistenLifecycle: UnlistenFn | undefined
@@ -92,6 +97,8 @@ async function openLatestRelease() {
 }
 
 onMounted(async () => {
+  // 直播播放窗口只渲染 LiveWindow，不初始化主界面逻辑
+  if (isLiveWindow) return
   unlistenLifecycle = await listen<LifecycleStatus>('lifecycle-status-changed', ({ payload }) => applyLifecycleStatus(payload))
   applyLifecycleStatus(await invoke<LifecycleStatus>('get_lifecycle_status'))
   await store.listenRecordingEvents()
